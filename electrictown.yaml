@@ -1,0 +1,69 @@
+# Electrictown Configuration
+# Maps agent roles to LLM providers and models.
+
+providers:
+  anthropic:
+    type: anthropic
+    base_url: https://api.anthropic.com
+    api_key: $ANTHROPIC_API_KEY
+
+  openai:
+    type: openai
+    base_url: https://api.openai.com/v1
+    api_key: $OPENAI_API_KEY
+
+  ollama-local:
+    type: ollama
+    base_url: http://localhost:11434
+
+  ollama-cloud:
+    type: ollama
+    base_url: https://api.ollama.com
+    api_key: $OLLAMA_API_KEY
+
+models:
+  claude-sonnet:
+    provider: anthropic
+    model: claude-sonnet-4-20250514
+
+  gpt4o:
+    provider: openai
+    model: gpt-4o
+
+  qwen-coder-local:
+    provider: ollama-local
+    model: qwen3-coder:32b
+
+  qwen-coder-cloud:
+    provider: ollama-cloud
+    model: qwen3-coder:480b-cloud
+
+  deepseek-local:
+    provider: ollama-local
+    model: deepseek-coder-v2:16b
+
+# Role assignments - map gastown roles to models.
+# Any model can fill any role.
+roles:
+  mayor:
+    model: claude-sonnet
+    fallbacks: [gpt4o]
+
+  polecat:
+    model: qwen-coder-local
+    fallbacks: [qwen-coder-cloud, deepseek-local]
+
+  crew:
+    model: qwen-coder-local
+
+  witness:
+    model: deepseek-local
+
+  refinery:
+    model: claude-sonnet
+
+defaults:
+  model: qwen-coder-local
+  fallbacks: [qwen-coder-cloud]
+  max_tokens: 4096
+  temperature: 0.0
