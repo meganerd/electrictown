@@ -1,0 +1,30 @@
+# Electrictown Local-Only Configuration
+# Uses only local Ollama — no API keys needed.
+# Requires: ollama running on localhost:11434
+
+providers:
+  ollama-local:
+    type: ollama
+    base_url: http://localhost:11434
+
+models:
+  supervisor-model:
+    provider: ollama-local
+    model: qwen3-coder:30b
+
+  worker-model:
+    provider: ollama-local
+    model: qwen3-coder:30b
+
+roles:
+  mayor:
+    model: supervisor-model
+    fallbacks: [worker-model]
+
+  polecat:
+    model: worker-model
+
+defaults:
+  model: worker-model
+  max_tokens: 4096
+  temperature: 0.0

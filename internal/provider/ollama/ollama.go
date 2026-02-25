@@ -304,7 +304,7 @@ type ollamaToolFunction struct {
 
 type ollamaChatResponse struct {
 	Model           string        `json:"model"`
-	CreatedAt       int64         `json:"created_at,omitempty"`
+	CreatedAt       interface{}   `json:"created_at,omitempty"`
 	Message         ollamaMessage `json:"message"`
 	Done            bool          `json:"done"`
 	TotalDuration   int64         `json:"total_duration,omitempty"`
