@@ -125,3 +125,157 @@ defaults: {}
 		t.Error("expected validation error for unknown model alias in role")
 	}
 }
+
+func TestValidation_CircularFallback(t *testing.T) {
+	bad := []byte(`
+providers:
+  anthropic:
+    type: anthropic
+    base_url: https://api.anthropic.com
+    api_key: test
+models:
+  sonnet:
+    provider: anthropic
+    model: claude-sonnet-4-20250514
+  sonnet-copy:
+    provider: anthropic
+    model: claude-sonnet-4-20250514
+roles:
+  mayor:
+    model: sonnet
+    fallbacks: [sonnet-copy]
+defaults:
+  model: sonnet
+`)
+	_, err := ParseConfig(bad)
+	if err == nil {
+		t.Error("expected validation error for fallback resolving to same provider+model as primary")
+	}
+}
+
+func TestValidation_EmptyProviderType(t *testing.T) {
+	bad := []byte(`
+providers:
+  mystery:
+    base_url: https://example.com
+models:
+  test-model:
+    provider: mystery
+    model: some-model
+roles: {}
+defaults:
+  model: test-model
+`)
+	_, err := ParseConfig(bad)
+	if err == nil {
+		t.Error("expected validation error for empty provider type")
+	}
+}
+
+func TestValidation_DefaultsFallbackUnknown(t *testing.T) {
+	bad := []byte(`
+providers:
+  anthropic:
+    type: anthropic
+    base_url: https://api.anthropic.com
+models:
+  sonnet:
+    provider: anthropic
+    model: claude-sonnet-4-20250514
+roles: {}
+defaults:
+  model: sonnet
+  fallbacks: [nonexistent-model]
+`)
+	_, err := ParseConfig(bad)
+	if err == nil {
+		t.Error("expected validation error for defaults fallback referencing unknown model alias")
+	}
+}
+
+func TestValidation_EmptyConfig(t *testing.T) {
+	empty := []byte(``)
+	_, err := ParseConfig(empty)
+	if err == nil {
+		t.Error("expected validation error for empty config with no providers")
+	}
+}
+
+func TestValidation_DuplicateFallback(t *testing.T) {
+	cfg := []byte(`
+providers:
+  anthropic:
+    type: anthropic
+    base_url: https://api.anthropic.com
+  ollama:
+    type: ollama
+    base_url: http://localhost:11434
+models:
+  sonnet:
+    provider: anthropic
+    model: claude-sonnet-4-20250514
+  qwen:
+    provider: ollama
+    model: qwen3-coder:32b
+roles:
+  mayor:
+    model: sonnet
+    fallbacks: [qwen, qwen]
+defaults:
+  model: sonnet
+`)
+	_, err := ParseConfig(cfg)
+	if err != nil {
+		t.Errorf("duplicate fallback should be accepted (redundant but valid), got: %v", err)
+	}
+}
+
+func TestResolveModel(t *testing.T) {
+	cfg, err := ParseConfig(testConfigYAML)
+	if err != nil {
+		t.Fatalf("ParseConfig failed: %v", err)
+	}
+	pc, model, err := cfg.ResolveModel("claude-sonnet")
+	if err != nil {
+		t.Fatalf("ResolveModel(claude-sonnet) failed: %v", err)
+	}
+	if pc.Type != "anthropic" {
+		t.Errorf("expected provider type anthropic, got %s", pc.Type)
+	}
+	if pc.BaseURL != "https://api.anthropic.com" {
+		t.Errorf("expected base_url https://api.anthropic.com, got %s", pc.BaseURL)
+	}
+	if model != "claude-sonnet-4-20250514" {
+		t.Errorf("expected model claude-sonnet-4-20250514, got %s", model)
+	}
+
+	// Unknown alias should error.
+	_, _, err = cfg.ResolveModel("nonexistent")
+	if err == nil {
+		t.Error("expected error for unknown model alias")
+	}
+}
+
+func TestResolveRole_Default(t *testing.T) {
+	cfg, err := ParseConfig(testConfigYAML)
+	if err != nil {
+		t.Fatalf("ParseConfig failed: %v", err)
+	}
+	// "crew" is not configured in roles, should fall back to defaults (qwen-local).
+	pc, model, err := cfg.ResolveRole("crew")
+	if err != nil {
+		t.Fatalf("ResolveRole(crew) failed: %v", err)
+	}
+	if pc.Type != "ollama" {
+		t.Errorf("expected provider type ollama from default, got %s", pc.Type)
+	}
+	if model != "qwen3-coder:32b" {
+		t.Errorf("expected model qwen3-coder:32b from default, got %s", model)
+	}
+
+	// Verify fallbacks come from defaults too.
+	fbs := cfg.FallbacksForRole("crew")
+	if fbs != nil {
+		t.Errorf("expected nil fallbacks from defaults (none configured), got %v", fbs)
+	}
+}

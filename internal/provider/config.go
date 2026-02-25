@@ -109,6 +109,33 @@ func (c *Config) Validate() error {
 			return fmt.Errorf("config: defaults reference unknown model alias %q", c.Defaults.Model)
 		}
 	}
+	for _, fb := range c.Defaults.Fallbacks {
+		if _, ok := c.Models[fb]; !ok {
+			return fmt.Errorf("config: defaults fallback references unknown model alias %q", fb)
+		}
+	}
+	// Warn on empty provider type.
+	for name, pc := range c.Providers {
+		if pc.Type == "" {
+			return fmt.Errorf("config: provider %q has empty type", name)
+		}
+	}
+	// Detect pointless fallbacks (same provider+model as primary).
+	for role, rc := range c.Roles {
+		primary, ok := c.Models[rc.Model]
+		if !ok {
+			continue // already caught above
+		}
+		for _, fb := range rc.Fallbacks {
+			fbModel, ok := c.Models[fb]
+			if !ok {
+				continue // already caught above
+			}
+			if primary.Provider == fbModel.Provider && primary.Model == fbModel.Model {
+				return fmt.Errorf("config: role %q fallback %q resolves to same provider+model as primary %q", role, fb, rc.Model)
+			}
+		}
+	}
 	return nil
 }
 

@@ -91,7 +91,11 @@ func (r *Router) StreamChatCompletionForRole(ctx context.Context, role string, r
 		return nil, err
 	}
 	req.Model = model
-	return p.StreamChatCompletion(ctx, req)
+	stream, err := p.StreamChatCompletion(ctx, req)
+	if err != nil {
+		return r.tryStreamFallbacks(ctx, role, req, err)
+	}
+	return stream, nil
 }
 
 // ListAllModels returns models from all configured providers.
@@ -181,4 +185,38 @@ func (r *Router) tryFallbacks(ctx context.Context, role string, req *ChatRequest
 		}
 	}
 	return nil, fmt.Errorf("router: all fallbacks exhausted for role %q (primary error: %w)", role, primaryErr)
+}
+
+// tryStreamFallbacks attempts fallback models for streaming after the primary fails.
+func (r *Router) tryStreamFallbacks(ctx context.Context, role string, req *ChatRequest, primaryErr error) (ChatStream, error) {
+	fallbacks := r.config.FallbacksForRole(role)
+	if len(fallbacks) == 0 {
+		return nil, primaryErr
+	}
+
+	errCode := ClassifyError(primaryErr)
+	// Only fall back on retryable errors.
+	switch errCode {
+	case ErrRateLimit, ErrContextWindow, ErrServerError, ErrTimeout:
+		// These are worth retrying with a different model.
+	default:
+		return nil, primaryErr
+	}
+
+	for _, fb := range fallbacks {
+		pc, model, err := r.config.ResolveModel(fb)
+		if err != nil {
+			continue
+		}
+		p, err := r.providerFor(pc)
+		if err != nil {
+			continue
+		}
+		req.Model = model
+		stream, err := p.StreamChatCompletion(ctx, req)
+		if err == nil {
+			return stream, nil
+		}
+	}
+	return nil, fmt.Errorf("router: all stream fallbacks exhausted for role %q (primary error: %w)", role, primaryErr)
 }
