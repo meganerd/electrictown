@@ -3,6 +3,7 @@ package provider
 import (
 	"fmt"
 	"os"
+	"strings"
 
 	"gopkg.in/yaml.v3"
 )
@@ -22,12 +23,20 @@ type Config struct {
 	Defaults DefaultsConfig `yaml:"defaults"`
 }
 
+// AuthType constants for provider authentication methods.
+const (
+	AuthNone   = "none"   // No authentication (default for local Ollama)
+	AuthBearer = "bearer" // Bearer token (default when api_key is set)
+	AuthBasic  = "basic"  // HTTP Basic Auth (for reverse-proxied Ollama)
+)
+
 // ProviderConfig defines connection details for a single provider.
 type ProviderConfig struct {
-	Type    string `yaml:"type"`              // "openai", "anthropic", "ollama"
-	BaseURL string `yaml:"base_url"`          // API base URL
-	APIKey  string `yaml:"api_key,omitempty"` // API key (or env var reference)
-	Org     string `yaml:"org,omitempty"`     // Organization ID (OpenAI)
+	Type     string `yaml:"type"`               // "openai", "anthropic", "ollama"
+	BaseURL  string `yaml:"base_url"`           // API base URL
+	APIKey   string `yaml:"api_key,omitempty"`  // API key (or env var reference)
+	AuthType string `yaml:"auth_type,omitempty"` // "bearer" (default), "basic", "none"
+	Org      string `yaml:"org,omitempty"`      // Organization ID (OpenAI)
 }
 
 // ModelConfig maps a model alias to a specific provider and model name.
@@ -114,10 +123,25 @@ func (c *Config) Validate() error {
 			return fmt.Errorf("config: defaults fallback references unknown model alias %q", fb)
 		}
 	}
-	// Warn on empty provider type.
+	// Warn on empty provider type and validate auth_type.
 	for name, pc := range c.Providers {
 		if pc.Type == "" {
 			return fmt.Errorf("config: provider %q has empty type", name)
+		}
+		// Validate auth_type if specified.
+		switch pc.AuthType {
+		case "", AuthBearer, AuthBasic, AuthNone:
+			// valid
+		default:
+			return fmt.Errorf("config: provider %q has invalid auth_type %q (must be bearer, basic, or none)", name, pc.AuthType)
+		}
+		if pc.AuthType == AuthBasic && pc.APIKey != "" && len(pc.APIKey) > 0 && pc.APIKey[0] != '$' {
+			if !strings.Contains(pc.APIKey, ":") {
+				return fmt.Errorf("config: provider %q auth_type is basic but api_key does not contain ':' (expected user:password)", name)
+			}
+		}
+		if (pc.AuthType == AuthBearer || pc.AuthType == AuthBasic) && pc.APIKey == "" {
+			return fmt.Errorf("config: provider %q auth_type is %q but no api_key is set", name, pc.AuthType)
 		}
 	}
 	// Detect pointless fallbacks (same provider+model as primary).

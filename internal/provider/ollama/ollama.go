@@ -6,6 +6,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -19,17 +20,34 @@ import (
 type OllamaProvider struct {
 	baseURL    string
 	apiKey     string
+	authType   string // "bearer" (default), "basic", or "none"
 	httpClient *http.Client
 }
 
 // New creates a new OllamaProvider. The baseURL should be the Ollama server
 // address (e.g., "http://localhost:11434" for local, "https://api.ollama.com"
 // for cloud). The apiKey is optional and used for Bearer auth with cloud.
-func New(baseURL string, apiKey string) *OllamaProvider {
-	return &OllamaProvider{
+// Use WithAuthType to set Basic auth for reverse-proxied instances.
+func New(baseURL string, apiKey string, opts ...OllamaOption) *OllamaProvider {
+	p := &OllamaProvider{
 		baseURL:    strings.TrimRight(baseURL, "/"),
 		apiKey:     apiKey,
+		authType:   "bearer",
 		httpClient: &http.Client{},
+	}
+	for _, opt := range opts {
+		opt(p)
+	}
+	return p
+}
+
+// OllamaOption configures an OllamaProvider.
+type OllamaOption func(*OllamaProvider)
+
+// WithAuthType sets the authentication type: "bearer" (default), "basic", or "none".
+func WithAuthType(authType string) OllamaOption {
+	return func(p *OllamaProvider) {
+		p.authType = authType
 	}
 }
 
@@ -143,7 +161,14 @@ func (p *OllamaProvider) ListModels(ctx context.Context) ([]provider.Model, erro
 
 func (p *OllamaProvider) setHeaders(req *http.Request) {
 	req.Header.Set("Content-Type", "application/json")
-	if p.apiKey != "" {
+	if p.apiKey == "" || p.authType == "none" {
+		return
+	}
+	switch p.authType {
+	case "basic":
+		encoded := base64.StdEncoding.EncodeToString([]byte(p.apiKey))
+		req.Header.Set("Authorization", "Basic "+encoded)
+	default: // "bearer" or unset
 		req.Header.Set("Authorization", "Bearer "+p.apiKey)
 	}
 }

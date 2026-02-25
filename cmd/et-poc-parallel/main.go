@@ -91,7 +91,11 @@ func run(configPath, task string) error {
 			if baseURL == "" {
 				baseURL = "http://localhost:11434"
 			}
-			return ollama.New(baseURL, pc.APIKey), nil
+			var opts []ollama.OllamaOption
+			if pc.AuthType != "" {
+				opts = append(opts, ollama.WithAuthType(pc.AuthType))
+			}
+			return ollama.New(baseURL, pc.APIKey, opts...), nil
 		},
 		"gemini": func(pc provider.ProviderConfig) (provider.Provider, error) {
 			var opts []gemini.Option

@@ -2,6 +2,7 @@ package ollama
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -388,4 +389,116 @@ func TestChatCompletionWithTemperature(t *testing.T) {
 func TestProviderInterface(t *testing.T) {
 	// Compile-time check that OllamaProvider implements provider.Provider.
 	var _ provider.Provider = (*OllamaProvider)(nil)
+}
+
+// --- Auth header tests ---
+
+// headerCapture creates a test server that captures the Authorization header
+// and returns a minimal valid Ollama response.
+func headerCapture(t *testing.T, gotAuth *string) *httptest.Server {
+	t.Helper()
+	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		*gotAuth = r.Header.Get("Authorization")
+		resp := ollamaChatResponse{
+			Model:   "llama3",
+			Message: ollamaMessage{Role: "assistant", Content: "ok"},
+			Done:    true,
+		}
+		json.NewEncoder(w).Encode(resp)
+	}))
+}
+
+func chatReq() *provider.ChatRequest {
+	return &provider.ChatRequest{
+		Model:    "llama3",
+		Messages: []provider.Message{{Role: provider.RoleUser, Content: "hi"}},
+	}
+}
+
+func TestSetHeaders_NoAuth(t *testing.T) {
+	var gotAuth string
+	srv := headerCapture(t, &gotAuth)
+	defer srv.Close()
+
+	p := New(srv.URL, "")
+	_, err := p.ChatCompletion(context.Background(), chatReq())
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if gotAuth != "" {
+		t.Errorf("expected no Authorization header, got %q", gotAuth)
+	}
+}
+
+func TestSetHeaders_BearerAuth(t *testing.T) {
+	var gotAuth string
+	srv := headerCapture(t, &gotAuth)
+	defer srv.Close()
+
+	p := New(srv.URL, "my-secret-key")
+	_, err := p.ChatCompletion(context.Background(), chatReq())
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	expected := "Bearer my-secret-key"
+	if gotAuth != expected {
+		t.Errorf("expected %q, got %q", expected, gotAuth)
+	}
+}
+
+func TestSetHeaders_BasicAuth(t *testing.T) {
+	var gotAuth string
+	srv := headerCapture(t, &gotAuth)
+	defer srv.Close()
+
+	p := New(srv.URL, "user:pass", WithAuthType("basic"))
+	_, err := p.ChatCompletion(context.Background(), chatReq())
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	expected := "Basic " + base64.StdEncoding.EncodeToString([]byte("user:pass"))
+	if gotAuth != expected {
+		t.Errorf("expected %q, got %q", expected, gotAuth)
+	}
+}
+
+func TestSetHeaders_NoneAuth(t *testing.T) {
+	var gotAuth string
+	srv := headerCapture(t, &gotAuth)
+	defer srv.Close()
+
+	p := New(srv.URL, "some-key-that-should-be-ignored", WithAuthType("none"))
+	_, err := p.ChatCompletion(context.Background(), chatReq())
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if gotAuth != "" {
+		t.Errorf("expected no Authorization header with auth_type=none, got %q", gotAuth)
+	}
+}
+
+func TestWithAuthType_Option(t *testing.T) {
+	p := New("http://localhost:11434", "key", WithAuthType("basic"))
+	if p.authType != "basic" {
+		t.Errorf("expected authType 'basic', got %q", p.authType)
+	}
+}
+
+func TestNew_BackwardsCompatible(t *testing.T) {
+	// New(url, key) without options should default to bearer auth.
+	var gotAuth string
+	srv := headerCapture(t, &gotAuth)
+	defer srv.Close()
+
+	p := New(srv.URL, "legacy-key")
+	if p.authType != "bearer" {
+		t.Errorf("expected default authType 'bearer', got %q", p.authType)
+	}
+	_, err := p.ChatCompletion(context.Background(), chatReq())
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if gotAuth != "Bearer legacy-key" {
+		t.Errorf("expected 'Bearer legacy-key', got %q", gotAuth)
+	}
 }

@@ -1,6 +1,7 @@
 package provider
 
 import (
+	"fmt"
 	"testing"
 )
 
@@ -253,6 +254,154 @@ func TestResolveModel(t *testing.T) {
 	_, _, err = cfg.ResolveModel("nonexistent")
 	if err == nil {
 		t.Error("expected error for unknown model alias")
+	}
+}
+
+func TestValidation_AuthType_Valid(t *testing.T) {
+	// bearer, basic, none, and empty (default) should all pass validation.
+	cases := []struct {
+		name     string
+		authType string
+		apiKey   string
+	}{
+		{"bearer explicit", "bearer", "my-key"},
+		{"basic with colon", "basic", "user:pass"},
+		{"none with key", "none", "some-key"},
+		{"empty (default)", "", "some-key"},
+		{"empty auth no key", "", ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			yaml := fmt.Sprintf(`
+providers:
+  test:
+    type: ollama
+    base_url: http://localhost:11434
+    api_key: "%s"
+    auth_type: "%s"
+models:
+  m:
+    provider: test
+    model: llama3
+roles: {}
+defaults:
+  model: m
+`, tc.apiKey, tc.authType)
+			_, err := ParseConfig([]byte(yaml))
+			if err != nil {
+				t.Errorf("expected valid config for auth_type=%q api_key=%q, got: %v", tc.authType, tc.apiKey, err)
+			}
+		})
+	}
+}
+
+func TestValidation_AuthType_Invalid(t *testing.T) {
+	bad := []byte(`
+providers:
+  test:
+    type: ollama
+    base_url: http://localhost:11434
+    api_key: my-key
+    auth_type: oauth2
+models:
+  m:
+    provider: test
+    model: llama3
+roles: {}
+defaults:
+  model: m
+`)
+	_, err := ParseConfig(bad)
+	if err == nil {
+		t.Error("expected validation error for invalid auth_type 'oauth2'")
+	}
+}
+
+func TestValidation_AuthType_BasicNoColon(t *testing.T) {
+	bad := []byte(`
+providers:
+  test:
+    type: ollama
+    base_url: http://localhost:11434
+    api_key: nocolonhere
+    auth_type: basic
+models:
+  m:
+    provider: test
+    model: llama3
+roles: {}
+defaults:
+  model: m
+`)
+	_, err := ParseConfig(bad)
+	if err == nil {
+		t.Error("expected validation error for basic auth with api_key missing ':'")
+	}
+}
+
+func TestValidation_AuthType_BearerNoKey(t *testing.T) {
+	bad := []byte(`
+providers:
+  test:
+    type: ollama
+    base_url: http://localhost:11434
+    auth_type: bearer
+models:
+  m:
+    provider: test
+    model: llama3
+roles: {}
+defaults:
+  model: m
+`)
+	_, err := ParseConfig(bad)
+	if err == nil {
+		t.Error("expected validation error for bearer auth with no api_key")
+	}
+}
+
+func TestValidation_AuthType_BasicNoKey(t *testing.T) {
+	bad := []byte(`
+providers:
+  test:
+    type: ollama
+    base_url: http://localhost:11434
+    auth_type: basic
+models:
+  m:
+    provider: test
+    model: llama3
+roles: {}
+defaults:
+  model: m
+`)
+	_, err := ParseConfig(bad)
+	if err == nil {
+		t.Error("expected validation error for basic auth with no api_key")
+	}
+}
+
+func TestValidation_AuthType_BasicEnvVar(t *testing.T) {
+	// When api_key starts with $, the colon check should be skipped
+	// because the actual value comes from the environment at runtime.
+	cfg := []byte(`
+providers:
+  test:
+    type: ollama
+    base_url: http://localhost:11434
+    api_key: $OLLAMA_BASIC_CREDS
+    auth_type: basic
+models:
+  m:
+    provider: test
+    model: llama3
+roles: {}
+defaults:
+  model: m
+`)
+	_, err := ParseConfig(cfg)
+	if err != nil {
+		t.Errorf("expected basic auth with $ENV_VAR api_key to skip colon check, got: %v", err)
 	}
 }
 

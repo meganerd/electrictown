@@ -156,6 +156,56 @@ defaults:
 
 API keys use `$ENV_VAR` syntax and are resolved from the environment at config load time. The config is validated on load -- unknown provider references, duplicate fallbacks, and empty fields are caught immediately.
 
+## Authentication
+
+Ollama providers support three `auth_type` values: `bearer` (default), `basic`, and `none`.
+
+**Local Ollama (no auth needed):**
+
+```yaml
+ollama-local:
+  type: ollama
+  base_url: http://localhost:11434
+```
+
+No `api_key` or `auth_type` required. When `api_key` is absent, no authorization header is sent.
+
+**Ollama Cloud (bearer token):**
+
+```yaml
+ollama-cloud:
+  type: ollama
+  base_url: https://ollama.com/api
+  api_key: $OLLAMA_API_KEY
+```
+
+When `api_key` is set and `auth_type` is omitted, it defaults to `bearer`. The request sends `Authorization: Bearer <key>`.
+
+**Network Ollama behind reverse proxy (bearer):**
+
+```yaml
+ollama-network:
+  type: ollama
+  base_url: https://ollama.internal.example.com
+  api_key: $OLLAMA_BEARER_TOKEN
+```
+
+Same behavior as cloud -- the reverse proxy forwards the Bearer header to Ollama or validates it itself.
+
+**Network Ollama behind reverse proxy (basic auth):**
+
+```yaml
+ollama-proxied:
+  type: ollama
+  base_url: https://ollama.internal.example.com
+  api_key: $OLLAMA_BASIC_CREDS  # user:password
+  auth_type: basic
+```
+
+Sends `Authorization: Basic <base64(user:password)>`. Use this with Caddy, nginx, or any proxy that gates access with HTTP basic auth. See [docs/caddy-reverse-proxy.md](docs/caddy-reverse-proxy.md) for a detailed proxy setup guide.
+
+**Note:** `auth_type` only applies to Ollama providers. OpenAI, Anthropic, and Gemini providers always use their native authentication mechanisms and ignore `auth_type`.
+
 ## Build
 
 ```bash
