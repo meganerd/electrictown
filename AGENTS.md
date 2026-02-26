@@ -45,6 +45,12 @@ bd close ET-<id>           # Mark done
 - **Agent Orchestrator** (gastown fork): Mayor, Polecats, Crew, Witness, Refinery
   roles managing multi-agent coding workflows
 - **Config System**: YAML-driven model→provider mapping per agent role
+- **Tmux Session Manager** (`internal/tmux/`): Provider-agnostic tmux/byobu session
+  management via `Runner` interface. `TmuxRunner` calls tmux directly, `ByobuRunner`
+  auto-detects byobu and delegates pane operations to tmux.
+- **Executor Layer** (`internal/session/executor.go`): `Executor` interface abstracts
+  session launch strategy. `SubprocessExecutor` for `et run`, `TmuxExecutor` for
+  `et session spawn`. New executors can be added without modifying `SessionLauncher`.
 
 ### Design Principles
 

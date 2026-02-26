@@ -44,6 +44,11 @@ func main() {
 			fmt.Fprintf(os.Stderr, "error: %v\n", err)
 			os.Exit(1)
 		}
+	case "session":
+		if err := cmdSession(os.Args[2:]); err != nil {
+			fmt.Fprintf(os.Stderr, "error: %v\n", err)
+			os.Exit(1)
+		}
 	case "version":
 		fmt.Printf("et %s\n", version)
 	case "--help", "-h", "help":
@@ -60,11 +65,13 @@ func printUsage() {
 
 Usage:
   et run [--config path] [--role name] "task description"
+  et session <spawn|list|attach|kill|send> [args]
   et models [--config path]
   et version
 
 Commands:
   run      Execute supervisor→worker flow for a task
+  session  Manage interactive agent sessions in tmux
   models   List all available models from configured providers
   version  Print version information
 
@@ -74,6 +81,8 @@ Flags (run):
 
 Flags (models):
   --config   Path to config file (default: electrictown.yaml)
+
+Run 'et session --help' for session management details.
 `)
 }
 

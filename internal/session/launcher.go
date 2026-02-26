@@ -10,28 +10,40 @@ import (
 	"time"
 )
 
-// cancelFuncs stores context cancel functions keyed by session ID.
-// This is package-level because SessionLauncher's struct definition lives
-// in session.go and we avoid modifying it. Access is guarded by cancelMu.
-var (
-	cancelFuncs = make(map[string]context.CancelFunc)
-	cancelMu    sync.Mutex
-)
+// ---------------------------------------------------------------------------
+// SubprocessExecutor — runs sessions as child processes (used by et run)
+// ---------------------------------------------------------------------------
+
+// SubprocessExecutor implements Executor by launching agent sessions as
+// OS subprocesses. This is the original execution strategy used by et run.
+type SubprocessExecutor struct {
+	adapter    ProviderAdapter
+	cancelFuncs map[string]context.CancelFunc
+	mu          sync.Mutex
+}
+
+// NewSubprocessExecutor creates a SubprocessExecutor backed by the given adapter.
+func NewSubprocessExecutor(adapter ProviderAdapter) *SubprocessExecutor {
+	return &SubprocessExecutor{
+		adapter:     adapter,
+		cancelFuncs: make(map[string]context.CancelFunc),
+	}
+}
 
 // storeCancelFunc saves a cancel function for the given session ID.
-func storeCancelFunc(sessionID string, cancel context.CancelFunc) {
-	cancelMu.Lock()
-	defer cancelMu.Unlock()
-	cancelFuncs[sessionID] = cancel
+func (e *SubprocessExecutor) storeCancelFunc(sessionID string, cancel context.CancelFunc) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.cancelFuncs[sessionID] = cancel
 }
 
 // removeCancelFunc removes and returns the cancel function for the given session ID.
-func removeCancelFunc(sessionID string) (context.CancelFunc, bool) {
-	cancelMu.Lock()
-	defer cancelMu.Unlock()
-	cancel, ok := cancelFuncs[sessionID]
+func (e *SubprocessExecutor) removeCancelFunc(sessionID string) (context.CancelFunc, bool) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	cancel, ok := e.cancelFuncs[sessionID]
 	if ok {
-		delete(cancelFuncs, sessionID)
+		delete(e.cancelFuncs, sessionID)
 	}
 	return cancel, ok
 }
@@ -39,9 +51,9 @@ func removeCancelFunc(sessionID string) (context.CancelFunc, bool) {
 // Execute launches the agent session as a subprocess, captures output, and manages lifecycle.
 // It runs the command built by the adapter, streams stdout/stderr to Session.Output,
 // and transitions status through starting->running->done (or failed).
-func (l *SessionLauncher) Execute(ctx context.Context, sess *Session) error {
+func (e *SubprocessExecutor) Execute(ctx context.Context, sess *Session) error {
 	// Build the command from the adapter.
-	cmdName, args := l.adapter.BuildCommand(sess.Config, sess.Prompt)
+	cmdName, args := e.adapter.BuildCommand(sess.Config, sess.Prompt)
 
 	// Transition to starting.
 	sess.SetStatus(StatusStarting)
@@ -57,9 +69,9 @@ func (l *SessionLauncher) Execute(ctx context.Context, sess *Session) error {
 	}
 
 	// Store cancel func so Stop() can use it.
-	storeCancelFunc(sess.ID, cancel)
+	e.storeCancelFunc(sess.ID, cancel)
 	defer func() {
-		removeCancelFunc(sess.ID)
+		e.removeCancelFunc(sess.ID)
 		cancel()
 	}()
 
@@ -113,6 +125,29 @@ func (l *SessionLauncher) Execute(ctx context.Context, sess *Session) error {
 	return nil
 }
 
+// Stop terminates a running session by cancelling its context.
+func (e *SubprocessExecutor) Stop(sessionID string) error {
+	cancel, ok := e.removeCancelFunc(sessionID)
+	if !ok {
+		return fmt.Errorf("no running session with ID %q", sessionID)
+	}
+	cancel()
+	return nil
+}
+
+// Compile-time interface compliance.
+var _ Executor = (*SubprocessExecutor)(nil)
+
+// ---------------------------------------------------------------------------
+// SessionLauncher delegation — preserves backward compatibility
+// ---------------------------------------------------------------------------
+
+// Execute delegates to the SessionLauncher's executor.
+// If no executor is set, it creates a default SubprocessExecutor.
+func (l *SessionLauncher) Execute(ctx context.Context, sess *Session) error {
+	return l.executor().Execute(ctx, sess)
+}
+
 // ExecuteAsync launches the session in a background goroutine.
 // Returns immediately. Check session Status for progress.
 func (l *SessionLauncher) ExecuteAsync(ctx context.Context, sess *Session) {
@@ -123,10 +158,20 @@ func (l *SessionLauncher) ExecuteAsync(ctx context.Context, sess *Session) {
 
 // Stop terminates a running session by cancelling its context.
 func (l *SessionLauncher) Stop(sessionID string) error {
-	cancel, ok := removeCancelFunc(sessionID)
-	if !ok {
-		return fmt.Errorf("no running session with ID %q", sessionID)
+	return l.executor().Stop(sessionID)
+}
+
+// executor returns the configured Executor, lazily creating a SubprocessExecutor
+// if none was set. This preserves backward compatibility for existing callers.
+func (l *SessionLauncher) executor() Executor {
+	if l.exec != nil {
+		return l.exec
 	}
-	cancel()
-	return nil
+	// Lazy init with default SubprocessExecutor.
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.exec == nil {
+		l.exec = NewSubprocessExecutor(l.adapter)
+	}
+	return l.exec
 }

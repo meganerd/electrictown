@@ -32,6 +32,7 @@ Both projects are independent works. Electrictown is its own implementation with
 - **Automatic fallback chains** on rate limit (429), timeout, server error (5xx), and context window overflow
 - **Cost tracking** with per-request recording and breakdowns by role, provider, and model
 - **Session layer** with provider-agnostic agent launching via the `ProviderAdapter` interface
+- **Tmux/Byobu session management** -- spawn, list, attach, kill, and send to persistent agent sessions in tmux panes with auto-detection of byobu
 - **Cross-platform builds** -- Linux amd64, arm64, riscv64, ppc64, ppc64le
 - **Single external dependency** -- `gopkg.in/yaml.v3`
 
@@ -225,6 +226,7 @@ Supported platforms: `linux/amd64`, `linux/arm64`, `linux/riscv64`, `linux/ppc64
 
 ```
 et run [--config path] [--role name] "task description"
+et session <spawn|list|attach|kill|send> [args]
 et models [--config path]
 et version
 ```
@@ -238,6 +240,27 @@ et run "implement a rate limiter with token bucket algorithm"
 # Specify config and supervisor role
 et run --config prod.yaml --role mayor "refactor the auth middleware"
 ```
+
+**`et session`** manages interactive agent sessions in tmux/byobu panes. Sessions are persistent, observable, and manageable via CLI.
+
+```bash
+# Spawn a new agent session in tmux
+et session spawn --role polecat --dir /tmp/project "implement binary search"
+
+# List active et-* sessions
+et session list
+
+# Attach to a running session
+et session attach et-polecat-a3f2
+
+# Send input to a session
+et session send et-polecat-a3f2 "add error handling"
+
+# Kill a session
+et session kill et-polecat-a3f2
+```
+
+Sessions are named `et-{role}-{short-hex}` and discovered statelessly from tmux. Byobu is auto-detected and used for session creation when available.
 
 **`et models`** lists all available models from all configured providers.
 

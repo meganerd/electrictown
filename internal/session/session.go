@@ -92,14 +92,25 @@ type ProviderAdapter interface {
 // SessionLauncher manages the lifecycle of agent sessions.
 type SessionLauncher struct {
 	adapter  ProviderAdapter
+	exec     Executor // optional; defaults to SubprocessExecutor
 	sessions map[string]*Session
 	mu       sync.RWMutex
 }
 
 // NewSessionLauncher creates a new SessionLauncher with the given provider adapter.
+// Uses SubprocessExecutor by default (lazily initialized on first Execute/Stop call).
 func NewSessionLauncher(adapter ProviderAdapter) *SessionLauncher {
 	return &SessionLauncher{
 		adapter:  adapter,
+		sessions: make(map[string]*Session),
+	}
+}
+
+// NewSessionLauncherWithExecutor creates a SessionLauncher with an explicit Executor.
+func NewSessionLauncherWithExecutor(adapter ProviderAdapter, exec Executor) *SessionLauncher {
+	return &SessionLauncher{
+		adapter:  adapter,
+		exec:     exec,
 		sessions: make(map[string]*Session),
 	}
 }
