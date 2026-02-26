@@ -17,11 +17,13 @@ import (
 	"strings"
 	"time"
 
+	"github.com/meganerd/electrictown/internal/pool"
 	"github.com/meganerd/electrictown/internal/provider"
 	"github.com/meganerd/electrictown/internal/provider/anthropic"
 	"github.com/meganerd/electrictown/internal/provider/gemini"
 	"github.com/meganerd/electrictown/internal/provider/ollama"
 	"github.com/meganerd/electrictown/internal/provider/openai"
+	"github.com/meganerd/electrictown/internal/role"
 )
 
 var version = "dev"
@@ -76,8 +78,10 @@ Commands:
   version  Print version information
 
 Flags (run):
-  --config   Path to config file (default: electrictown.yaml)
-  --role     Supervisor role name (default: mayor; worker always uses polecat)
+  --config         Path to config file (default: electrictown.yaml)
+  --role           Supervisor role name (default: mayor; worker always uses polecat)
+  --no-synthesize  Skip synthesis, print raw per-worker output (pool mode only)
+  --max-subtasks   Max subtasks for decomposition (0 = Mayor default of 5)
 
 Flags (models):
   --config   Path to config file (default: electrictown.yaml)
@@ -125,10 +129,15 @@ func buildFactories() map[string]provider.ProviderFactory {
 }
 
 // cmdRun implements the "et run" subcommand.
+// When the worker role has a pool configured, it uses a three-phase pipeline:
+// decompose → parallel execute → synthesize. Otherwise, it falls back to the
+// original single-worker streaming flow.
 func cmdRun(args []string) error {
 	fs := flag.NewFlagSet("run", flag.ExitOnError)
 	configPath := fs.String("config", "electrictown.yaml", "path to config file")
 	supervisorRole := fs.String("role", "mayor", "supervisor role name")
+	noSynthesize := fs.Bool("no-synthesize", false, "skip synthesis, print raw per-worker output")
+	maxSubtasks := fs.Int("max-subtasks", 0, "max subtasks (0 = use Mayor default of 5)")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -159,8 +168,84 @@ func cmdRun(args []string) error {
 	fmt.Printf("Config: %s\n", *configPath)
 	fmt.Printf("Task:   %s\n\n", task)
 
+	// Check if the worker role has a pool configured.
+	poolAliases := cfg.PoolForRole(workerRole)
+	if len(poolAliases) > 0 {
+		return cmdRunParallel(ctx, router, cfg, task, *supervisorRole, poolAliases, *noSynthesize, *maxSubtasks)
+	}
+
+	// Legacy single-worker flow (no pool configured).
+	return cmdRunSingle(ctx, router, task, *supervisorRole, workerRole)
+}
+
+// cmdRunParallel implements the three-phase pipeline: decompose → parallel execute → synthesize.
+func cmdRunParallel(ctx context.Context, router *provider.Router, cfg *provider.Config, task, supervisorRole string, poolAliases []string, noSynthesize bool, maxSubtasks int) error {
+	// Build Mayor with options.
+	var mayorOpts []role.MayorOption
+	mayorOpts = append(mayorOpts, role.WithMayorRole(supervisorRole))
+	if maxSubtasks > 0 {
+		mayorOpts = append(mayorOpts, role.WithMayorMaxSubtasks(maxSubtasks))
+	}
+	mayor := role.NewMayor(router, mayorOpts...)
+
+	// Phase 1: Decompose.
+	fmt.Printf("Phase 1: Supervisor (%s) decomposing task...\n", supervisorRole)
+	subtasks, err := mayor.Decompose(ctx, task)
+	if err != nil {
+		return fmt.Errorf("supervisor decompose failed: %w", err)
+	}
+	fmt.Printf("  Subtasks: %d\n\n", len(subtasks))
+	for i, st := range subtasks {
+		fmt.Printf("  [%d] %s\n", i+1, truncate(st, 100))
+	}
+	fmt.Println()
+
+	// Phase 2: Parallel worker execution.
+	fmt.Printf("Phase 2: Workers executing in parallel (%d subtasks, %d pool members)...\n", len(subtasks), len(poolAliases))
+
+	balancer := provider.NewBalancer(provider.StrategyRoundRobin)
+	wp := pool.New(router, balancer, poolAliases)
+	workerSystemPrompt := "You are a coding worker. Implement exactly what is asked. Output ONLY the code -- no explanations, no markdown fences unless specifically requested."
+
+	start := time.Now()
+	results := wp.ExecuteAll(ctx, subtasks, workerSystemPrompt)
+	elapsed := time.Since(start)
+
+	for i, r := range results {
+		status := "✓"
+		if strings.HasPrefix(r.Response, "error:") {
+			status = "✗"
+		}
+		fmt.Printf("  [%d/%d] %-16s %s (%d tokens, %.1fs)\n", i+1, len(results), r.Role, status, r.Tokens, elapsed.Seconds())
+	}
+	fmt.Println()
+
+	// Phase 3: Synthesize (unless --no-synthesize).
+	if noSynthesize {
+		for i, r := range results {
+			fmt.Printf("--- Worker %d (%s: subtask %d) ---\n", i+1, r.Role, i+1)
+			fmt.Println(r.Response)
+		}
+		return nil
+	}
+
+	fmt.Printf("Phase 3: Supervisor synthesizing results...\n")
+	synthesis, err := mayor.Synthesize(ctx, task, results)
+	if err != nil {
+		return fmt.Errorf("supervisor synthesize failed: %w", err)
+	}
+
+	fmt.Printf("\n--- Final Output ---\n")
+	fmt.Println(synthesis)
+	fmt.Printf("--------------------\n")
+
+	return nil
+}
+
+// cmdRunSingle implements the legacy single-worker streaming flow.
+func cmdRunSingle(ctx context.Context, router *provider.Router, task, supervisorRole, workerRole string) error {
 	// Phase 1: Supervisor generates subtask via ChatCompletion.
-	fmt.Printf("Phase 1: Supervisor (%s) analyzing task...\n", *supervisorRole)
+	fmt.Printf("Phase 1: Supervisor (%s) analyzing task...\n", supervisorRole)
 
 	supervisorReq := &provider.ChatRequest{
 		Messages: []provider.Message{
@@ -175,7 +260,7 @@ func cmdRun(args []string) error {
 		},
 	}
 
-	supervisorResp, err := router.ChatCompletionForRole(ctx, *supervisorRole, supervisorReq)
+	supervisorResp, err := router.ChatCompletionForRole(ctx, supervisorRole, supervisorReq)
 	if err != nil {
 		return fmt.Errorf("supervisor request failed: %w", err)
 	}

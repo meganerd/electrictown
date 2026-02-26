@@ -405,6 +405,77 @@ defaults:
 	}
 }
 
+func TestPoolForRole(t *testing.T) {
+	cfg, err := ParseConfig([]byte(`
+providers:
+  ollama-local:
+    type: ollama
+    base_url: http://localhost:11434
+  ollama-ai01:
+    type: ollama
+    base_url: http://ai01:11434
+models:
+  qwen-local:
+    provider: ollama-local
+    model: qwen3-coder:32b
+  qwen-ai01:
+    provider: ollama-ai01
+    model: qwen3-coder:32b
+roles:
+  polecat:
+    model: qwen-local
+    pool: [qwen-local, qwen-ai01]
+  mayor:
+    model: qwen-local
+defaults:
+  model: qwen-local
+`))
+	if err != nil {
+		t.Fatalf("ParseConfig failed: %v", err)
+	}
+
+	pool := cfg.PoolForRole("polecat")
+	if len(pool) != 2 {
+		t.Fatalf("expected 2 pool members, got %d", len(pool))
+	}
+	if pool[0] != "qwen-local" || pool[1] != "qwen-ai01" {
+		t.Errorf("unexpected pool members: %v", pool)
+	}
+
+	// Role without pool returns nil.
+	if p := cfg.PoolForRole("mayor"); p != nil {
+		t.Errorf("expected nil pool for mayor, got %v", p)
+	}
+
+	// Unknown role returns nil.
+	if p := cfg.PoolForRole("unknown"); p != nil {
+		t.Errorf("expected nil pool for unknown role, got %v", p)
+	}
+}
+
+func TestValidation_PoolUnknownAlias(t *testing.T) {
+	bad := []byte(`
+providers:
+  ollama:
+    type: ollama
+    base_url: http://localhost:11434
+models:
+  qwen:
+    provider: ollama
+    model: qwen3-coder:32b
+roles:
+  polecat:
+    model: qwen
+    pool: [qwen, nonexistent-model]
+defaults:
+  model: qwen
+`)
+	_, err := ParseConfig(bad)
+	if err == nil {
+		t.Error("expected validation error for unknown model alias in pool")
+	}
+}
+
 func TestResolveRole_Default(t *testing.T) {
 	cfg, err := ParseConfig(testConfigYAML)
 	if err != nil {

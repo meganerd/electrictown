@@ -34,7 +34,32 @@ Both projects are independent works. Electrictown is its own implementation with
 - **Session layer** with provider-agnostic agent launching via the `ProviderAdapter` interface
 - **Tmux/Byobu session management** -- spawn, list, attach, kill, and send to persistent agent sessions in tmux panes with auto-detection of byobu
 - **Cross-platform builds** -- Linux amd64, arm64, riscv64, ppc64, ppc64le
+- **Parallel worker pool** -- fan out subtasks across multiple hosts/models concurrently with bounded concurrency
 - **Single external dependency** -- `gopkg.in/yaml.v3`
+
+## Parallel Worker Pool
+
+When a role has a `pool` configured, `et run` uses a three-phase pipeline:
+
+1. **Decompose** -- the Mayor supervisor breaks the task into discrete subtasks
+2. **Parallel Execute** -- the WorkerPool fans subtasks out across pool members concurrently
+3. **Synthesize** -- the Mayor combines worker results into a unified response
+
+Pool members are model aliases, each mapping to a different provider/host. This enables heterogeneous fleet utilization -- e.g., localhost, ai01, phoenix, and multiple rk3588 boards all running Ollama.
+
+```yaml
+roles:
+  polecat:
+    model: qwen-local            # primary (used when pool is empty)
+    pool:                         # parallel worker pool
+      - qwen-local               # localhost
+      - qwen-ai01                # ai01
+      - qwen-phoenix             # phoenix
+      - qwen-rk3588-1            # rk3588 #1
+    fallbacks: [qwen-cloud]      # fallback if ALL pool members fail
+```
+
+Concurrency is bounded to `min(subtasks, pool_size)` goroutines. Per-worker errors don't abort other workers. Results are returned in subtask order regardless of completion order.
 
 ## Architecture
 
@@ -139,6 +164,9 @@ roles:
 
   polecat:
     model: qwen-coder-local
+    pool:                                    # parallel worker pool (optional)
+      - qwen-coder-local                     # localhost
+      - qwen-coder-cloud                     # cloud fallback
     fallbacks: [qwen-coder-cloud]          # fall back to cloud if local is down
 
   witness:
@@ -231,11 +259,20 @@ et models [--config path]
 et version
 ```
 
-**`et run`** executes a supervisor-to-worker flow: the supervisor (default: `mayor` role) decomposes the task, then the worker (`polecat` role) executes it with streaming output.
+**`et run`** executes a supervisor-to-worker flow. When the worker role (`polecat`) has a `pool` configured, it uses a three-phase pipeline: decompose → parallel execute → synthesize. Otherwise, single-worker streaming is used.
 
 ```bash
-# Use default config (electrictown.yaml) and default roles
+# Single-worker mode (no pool configured)
 et run "implement a rate limiter with token bucket algorithm"
+
+# Parallel pool mode (pool configured in polecat role)
+et run --config fleet.yaml "implement a REST API for user management"
+
+# Skip synthesis -- print raw per-worker output
+et run --no-synthesize "implement a REST API"
+
+# Limit subtasks
+et run --max-subtasks 3 "build a web server"
 
 # Specify config and supervisor role
 et run --config prod.yaml --role mayor "refactor the auth middleware"

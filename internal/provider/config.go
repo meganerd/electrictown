@@ -48,6 +48,7 @@ type ModelConfig struct {
 // RoleConfig defines which model(s) a given agent role should use.
 type RoleConfig struct {
 	Model     string   `yaml:"model"`               // primary model alias
+	Pool      []string `yaml:"pool,omitempty"`       // parallel worker pool model aliases
 	Fallbacks []string `yaml:"fallbacks,omitempty"`  // fallback model aliases in order
 }
 
@@ -109,6 +110,11 @@ func (c *Config) Validate() error {
 		for _, fb := range rc.Fallbacks {
 			if _, ok := c.Models[fb]; !ok {
 				return fmt.Errorf("config: role %q fallback references unknown model alias %q", role, fb)
+			}
+		}
+		for _, pa := range rc.Pool {
+			if _, ok := c.Models[pa]; !ok {
+				return fmt.Errorf("config: role %q pool references unknown model alias %q", role, pa)
 			}
 		}
 	}
@@ -195,4 +201,12 @@ func (c *Config) FallbacksForRole(role string) []string {
 		return rc.Fallbacks
 	}
 	return c.Defaults.Fallbacks
+}
+
+// PoolForRole returns the pool model aliases for a role, or nil if no pool is configured.
+func (c *Config) PoolForRole(role string) []string {
+	if rc, ok := c.Roles[role]; ok {
+		return rc.Pool
+	}
+	return nil
 }

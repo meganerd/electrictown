@@ -52,6 +52,11 @@ bd close ET-<id>           # Mark done
   session launch strategy. `SubprocessExecutor` for `et run`, `TmuxExecutor` for
   `et session spawn`. New executors can be added without modifying `SessionLauncher`.
 
+- **WorkerPool** (`internal/pool/`): Parallel worker dispatcher that fans subtasks out
+  across multiple model aliases using the `Balancer` for round-robin assignment and the
+  `Router` for request routing. Bounded concurrency via semaphore channel. Results ordered
+  by subtask index. Per-worker errors don't abort other workers.
+
 ### Design Principles
 
 1. **Go-native**: All glue code in Go. No Python/Node dependencies.
