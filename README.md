@@ -45,7 +45,7 @@ When a role has a `pool` configured, `et run` uses a three-phase pipeline:
 2. **Parallel Execute** -- the WorkerPool fans subtasks out across pool members concurrently
 3. **Synthesize** -- the Mayor combines worker results into a unified response
 
-Pool members are model aliases, each mapping to a different provider/host. This enables heterogeneous fleet utilization -- e.g., localhost, ai01, phoenix, and multiple rk3588 boards all running Ollama.
+Pool members are model aliases, each mapping to a different provider/host. This enables heterogeneous fleet utilization -- e.g., localhost, cloud-host, windows-host-with-ollama, and multiple rk3588 boards all running Ollama.
 
 ```yaml
 roles:
