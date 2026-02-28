@@ -3,6 +3,7 @@ package provider
 import (
 	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
 
 	"gopkg.in/yaml.v3"
@@ -58,6 +59,7 @@ type DefaultsConfig struct {
 	Fallbacks   []string `yaml:"fallbacks,omitempty"`    // default fallback chain
 	MaxTokens   int      `yaml:"max_tokens,omitempty"`   // default max tokens
 	Temperature float64  `yaml:"temperature,omitempty"`  // default temperature
+	LogDir      string   `yaml:"log_dir,omitempty"`      // directory for run logs (default: ~/Documents)
 }
 
 // LoadConfig reads and parses an electrictown YAML config file.
@@ -174,6 +176,27 @@ func (c *Config) Validate() error {
 		}
 	}
 	return nil
+}
+
+// ResolveLogDir returns the configured log directory, expanding ~ and falling
+// back to ~/Documents when no log_dir is set in the config.
+func (c *Config) ResolveLogDir() (string, error) {
+	dir := c.Defaults.LogDir
+	if dir == "" {
+		home, err := os.UserHomeDir()
+		if err != nil {
+			return "", fmt.Errorf("cannot determine home directory: %w", err)
+		}
+		return filepath.Join(home, "Documents"), nil
+	}
+	if len(dir) >= 2 && dir[:2] == "~/" {
+		home, err := os.UserHomeDir()
+		if err != nil {
+			return "", fmt.Errorf("cannot determine home directory: %w", err)
+		}
+		return filepath.Join(home, dir[2:]), nil
+	}
+	return dir, nil
 }
 
 // ResolveRole returns the provider config and model name for a given role.

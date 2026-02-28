@@ -35,6 +35,7 @@ type SessionConfig struct {
 	Args             []string          // base arguments
 	Env              map[string]string // environment variables
 	WorkDir          string            // working directory
+	OutputDir        string            // directory for writing output files (empty = stdout only)
 	InstructionsFile string            // CLAUDE.md, AGENTS.md, etc.
 	Model            string            // model to use (resolved from config)
 	Timeout          time.Duration     // session timeout
@@ -235,14 +236,17 @@ func (a *ElectrictownAdapter) ProvisionHooks(workDir string, role string) error 
 }
 
 // BuildCommand constructs the et CLI command to launch an agent session.
-// Returns the command and args: et run --config <path> --role <role> <prompt>
+// Returns the command and args: et run --config <path> --role <role> [--output-dir <dir>] <prompt>
 func (a *ElectrictownAdapter) BuildCommand(cfg *SessionConfig, prompt string) (string, []string) {
 	args := []string{
 		"run",
 		"--config", a.configPath,
 		"--role", cfg.Role,
-		prompt,
 	}
+	if cfg.OutputDir != "" {
+		args = append(args, "--output-dir", cfg.OutputDir)
+	}
+	args = append(args, prompt)
 	return "et", args
 }
 

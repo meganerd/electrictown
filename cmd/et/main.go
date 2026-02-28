@@ -84,6 +84,7 @@ Flags (run):
   --no-synthesize  Skip synthesis, print raw per-worker output (pool mode only)
   --max-subtasks   Max subtasks for decomposition (0 = Mayor default of 5)
   --timeout        Total timeout in minutes for the entire run (default: 30)
+  --output-dir     Directory to write output files (default: stdout only)
 
 Flags (models):
   --config   Path to config file (default: ./electrictown.yaml, then $HOME/electrictown.yaml)
@@ -141,6 +142,7 @@ func cmdRun(args []string) error {
 	noSynthesize := fs.Bool("no-synthesize", false, "skip synthesis, print raw per-worker output")
 	maxSubtasks := fs.Int("max-subtasks", 0, "max subtasks (0 = use Mayor default of 5)")
 	timeoutMins := fs.Int("timeout", 30, "total timeout in minutes for the entire run")
+	outputDir := fs.String("output-dir", "", "directory to write output files (default: stdout only)")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -180,15 +182,15 @@ func cmdRun(args []string) error {
 	// Check if the worker role has a pool configured.
 	poolAliases := cfg.PoolForRole(workerRole)
 	if len(poolAliases) > 0 {
-		return cmdRunParallel(ctx, router, cfg, task, *supervisorRole, poolAliases, *noSynthesize, *maxSubtasks)
+		return cmdRunParallel(ctx, router, cfg, task, *supervisorRole, poolAliases, *noSynthesize, *maxSubtasks, *outputDir)
 	}
 
 	// Legacy single-worker flow (no pool configured).
-	return cmdRunSingle(ctx, router, task, *supervisorRole, workerRole)
+	return cmdRunSingle(ctx, router, task, *supervisorRole, workerRole, *outputDir)
 }
 
 // cmdRunParallel implements the three-phase pipeline: decompose → parallel execute → synthesize.
-func cmdRunParallel(ctx context.Context, router *provider.Router, cfg *provider.Config, task, supervisorRole string, poolAliases []string, noSynthesize bool, maxSubtasks int) error {
+func cmdRunParallel(ctx context.Context, router *provider.Router, cfg *provider.Config, task, supervisorRole string, poolAliases []string, noSynthesize bool, maxSubtasks int, outputDir string) error {
 	// Build Mayor with options.
 	var mayorOpts []role.MayorOption
 	mayorOpts = append(mayorOpts, role.WithMayorRole(supervisorRole))
@@ -214,7 +216,7 @@ func cmdRunParallel(ctx context.Context, router *provider.Router, cfg *provider.
 
 	balancer := provider.NewBalancer(provider.StrategyRoundRobin)
 	wp := pool.New(router, balancer, poolAliases)
-	workerSystemPrompt := "You are a coding worker. Implement exactly what is asked. Output ONLY the code -- no explanations, no markdown fences unless specifically requested."
+	workerSystemPrompt := workerPrompt(outputDir)
 
 	start := time.Now()
 	results := wp.ExecuteAll(ctx, subtasks, workerSystemPrompt)
@@ -234,6 +236,18 @@ func cmdRunParallel(ctx context.Context, router *provider.Router, cfg *provider.
 		for i, r := range results {
 			fmt.Printf("--- Worker %d (%s: subtask %d) ---\n", i+1, r.Role, i+1)
 			fmt.Println(r.Response)
+			if outputDir != "" {
+				filename, content := parseWorkerOutput(r.Response)
+				if filename == "" {
+					filename = fmt.Sprintf("worker-%d.out", i+1)
+					content = r.Response
+				}
+				if err := writeOutputFile(outputDir, filename, content); err != nil {
+					fmt.Fprintf(os.Stderr, "  warning: could not write %s: %v\n", filename, err)
+				} else {
+					fmt.Printf("  → wrote %s\n", filepath.Join(outputDir, filename))
+				}
+			}
 		}
 		return nil
 	}
@@ -248,11 +262,32 @@ func cmdRunParallel(ctx context.Context, router *provider.Router, cfg *provider.
 	fmt.Println(synthesis)
 	fmt.Printf("--------------------\n")
 
+	// Write worker files and synthesis when output-dir is set.
+	if outputDir != "" {
+		for i, r := range results {
+			filename, content := parseWorkerOutput(r.Response)
+			if filename == "" {
+				filename = fmt.Sprintf("worker-%d.out", i+1)
+				content = r.Response
+			}
+			if err := writeOutputFile(outputDir, filename, content); err != nil {
+				fmt.Fprintf(os.Stderr, "  warning: could not write %s: %v\n", filename, err)
+			} else {
+				fmt.Printf("  → wrote %s\n", filepath.Join(outputDir, filename))
+			}
+		}
+		if err := writeOutputFile(outputDir, "_synthesis.md", synthesis); err != nil {
+			fmt.Fprintf(os.Stderr, "  warning: could not write _synthesis.md: %v\n", err)
+		} else {
+			fmt.Printf("  → wrote %s\n", filepath.Join(outputDir, "_synthesis.md"))
+		}
+	}
+
 	return nil
 }
 
 // cmdRunSingle implements the legacy single-worker streaming flow.
-func cmdRunSingle(ctx context.Context, router *provider.Router, task, supervisorRole, workerRole string) error {
+func cmdRunSingle(ctx context.Context, router *provider.Router, task, supervisorRole, workerRole, outputDir string) error {
 	// Phase 1: Supervisor generates subtask via ChatCompletion.
 	fmt.Printf("Phase 1: Supervisor (%s) analyzing task...\n", supervisorRole)
 
@@ -285,7 +320,7 @@ func cmdRunSingle(ctx context.Context, router *provider.Router, task, supervisor
 		Messages: []provider.Message{
 			{
 				Role:    provider.RoleSystem,
-				Content: "You are a coding worker. Implement exactly what is asked. Output ONLY the code -- no explanations, no markdown fences unless specifically requested.",
+				Content: workerPrompt(outputDir),
 			},
 			{
 				Role:    provider.RoleUser,
@@ -332,6 +367,21 @@ func cmdRunSingle(ctx context.Context, router *provider.Router, task, supervisor
 		fmt.Printf("  (streaming)\n\n--- Worker Output ---\n")
 		fmt.Print(totalContent.String())
 		fmt.Printf("\n---------------------\n")
+	}
+
+	// Write output file when output-dir is set.
+	if outputDir != "" {
+		content := totalContent.String()
+		filename, fileContent := parseWorkerOutput(content)
+		if filename == "" {
+			filename = "output.txt"
+			fileContent = content
+		}
+		if err := writeOutputFile(outputDir, filename, fileContent); err != nil {
+			fmt.Fprintf(os.Stderr, "  warning: could not write %s: %v\n", filename, err)
+		} else {
+			fmt.Printf("  → wrote %s\n", filepath.Join(outputDir, filename))
+		}
 	}
 
 	// Usage summary.
@@ -430,4 +480,42 @@ func truncate(s string, maxLen int) string {
 		return s
 	}
 	return s[:maxLen-3] + "..."
+}
+
+// workerPrompt returns the system prompt for workers, adding a FILENAME: instruction
+// when outputDir is set so the LLM indicates which file its output belongs to.
+func workerPrompt(outputDir string) string {
+	base := "You are a coding worker. Implement exactly what is asked."
+	if outputDir != "" {
+		return base + " Start your response with EXACTLY this line:\nFILENAME: relative/path/to/file\nThen output ONLY the file content — no explanations, no markdown fences unless the file format requires them."
+	}
+	return base + " Output ONLY the code -- no explanations, no markdown fences unless specifically requested."
+}
+
+// parseWorkerOutput extracts a filename and content from a worker response that
+// begins with "FILENAME: path". Returns empty filename if the format is absent.
+func parseWorkerOutput(response string) (filename, content string) {
+	const prefix = "FILENAME: "
+	idx := strings.Index(response, "\n")
+	if idx < 0 {
+		return "", response
+	}
+	firstLine := strings.TrimSpace(response[:idx])
+	if !strings.HasPrefix(firstLine, prefix) {
+		return "", response
+	}
+	filename = strings.TrimSpace(strings.TrimPrefix(firstLine, prefix))
+	// Strip leading slash to ensure relative path.
+	filename = strings.TrimPrefix(filename, "/")
+	content = response[idx+1:]
+	return filename, content
+}
+
+// writeOutputFile writes content to path/filename, creating parent directories.
+func writeOutputFile(dir, filename, content string) error {
+	fullPath := filepath.Join(dir, filename)
+	if err := os.MkdirAll(filepath.Dir(fullPath), 0755); err != nil {
+		return fmt.Errorf("create directories for %s: %w", fullPath, err)
+	}
+	return os.WriteFile(fullPath, []byte(content), 0644)
 }

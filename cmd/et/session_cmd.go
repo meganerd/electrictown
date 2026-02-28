@@ -96,6 +96,7 @@ func cmdSessionSpawn(args []string) error {
 		return fmt.Errorf("resolve config for role %q: %w", *role, err)
 	}
 	sessCfg.WorkDir = *workDir
+	sessCfg.OutputDir = *workDir
 
 	// Build the shell-quoted command to send into the session.
 	// Using send-keys avoids all shell quoting issues with arbitrary prompt text.
