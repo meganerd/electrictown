@@ -187,7 +187,7 @@ func (c *Config) ResolveLogDir() (string, error) {
 		if err != nil {
 			return "", fmt.Errorf("cannot determine home directory: %w", err)
 		}
-		return filepath.Join(home, "Documents"), nil
+		return filepath.Join(home, "Documents", "electrictown-logs"), nil
 	}
 	if len(dir) >= 2 && dir[:2] == "~/" {
 		home, err := os.UserHomeDir()
