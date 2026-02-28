@@ -81,7 +81,13 @@ func ParseConfig(data []byte) (*Config, error) {
 	// Resolve environment variable references in API keys.
 	for name, p := range cfg.Providers {
 		if len(p.APIKey) > 0 && p.APIKey[0] == '$' {
-			p.APIKey = os.Getenv(p.APIKey[1:])
+			varName := p.APIKey[1:]
+			p.APIKey = os.Getenv(varName)
+			// Only fail if auth actually requires a key (bearer or basic).
+			// Ollama and other providers with no auth_type treat an empty key as unauthenticated.
+			if p.APIKey == "" && (p.AuthType == AuthBearer || p.AuthType == AuthBasic) {
+				return nil, fmt.Errorf("provider %q requires an API key but $%s is not set or is empty", name, varName)
+			}
 			cfg.Providers[name] = p
 		}
 	}

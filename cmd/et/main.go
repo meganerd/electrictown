@@ -14,6 +14,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -38,12 +39,12 @@ func main() {
 	switch subcmd {
 	case "run":
 		if err := cmdRun(os.Args[2:]); err != nil {
-			fmt.Fprintf(os.Stderr, "error: %v\n", err)
+			fmt.Fprintf(os.Stderr, "error: %s\n", friendlyError(err))
 			os.Exit(1)
 		}
 	case "models":
 		if err := cmdModels(os.Args[2:]); err != nil {
-			fmt.Fprintf(os.Stderr, "error: %v\n", err)
+			fmt.Fprintf(os.Stderr, "error: %s\n", friendlyError(err))
 			os.Exit(1)
 		}
 	case "session":
@@ -78,13 +79,14 @@ Commands:
   version  Print version information
 
 Flags (run):
-  --config         Path to config file (default: electrictown.yaml)
+  --config         Path to config file (default: ./electrictown.yaml, then $HOME/electrictown.yaml)
   --role           Supervisor role name (default: mayor; worker always uses polecat)
   --no-synthesize  Skip synthesis, print raw per-worker output (pool mode only)
   --max-subtasks   Max subtasks for decomposition (0 = Mayor default of 5)
+  --timeout        Total timeout in minutes for the entire run (default: 30)
 
 Flags (models):
-  --config   Path to config file (default: electrictown.yaml)
+  --config   Path to config file (default: ./electrictown.yaml, then $HOME/electrictown.yaml)
 
 Run 'et session --help' for session management details.
 `)
@@ -134,10 +136,11 @@ func buildFactories() map[string]provider.ProviderFactory {
 // original single-worker streaming flow.
 func cmdRun(args []string) error {
 	fs := flag.NewFlagSet("run", flag.ExitOnError)
-	configPath := fs.String("config", "electrictown.yaml", "path to config file")
+	configPath := fs.String("config", "", "path to config file (default: ./electrictown.yaml, then $HOME/electrictown.yaml)")
 	supervisorRole := fs.String("role", "mayor", "supervisor role name")
 	noSynthesize := fs.Bool("no-synthesize", false, "skip synthesis, print raw per-worker output")
 	maxSubtasks := fs.Int("max-subtasks", 0, "max subtasks (0 = use Mayor default of 5)")
+	timeoutMins := fs.Int("timeout", 30, "total timeout in minutes for the entire run")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -149,11 +152,17 @@ func cmdRun(args []string) error {
 
 	workerRole := "polecat"
 
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(*timeoutMins)*time.Minute)
 	defer cancel()
 
+	// Resolve config path (explicit or auto-discover).
+	resolvedConfig, err := findConfig(*configPath)
+	if err != nil {
+		return err
+	}
+
 	// Load config and create router.
-	cfg, err := provider.LoadConfig(*configPath)
+	cfg, err := provider.LoadConfig(resolvedConfig)
 	if err != nil {
 		return fmt.Errorf("loading config: %w", err)
 	}
@@ -165,7 +174,7 @@ func cmdRun(args []string) error {
 
 	fmt.Printf("electrictown\n")
 	fmt.Printf("============\n")
-	fmt.Printf("Config: %s\n", *configPath)
+	fmt.Printf("Config: %s\n", resolvedConfig)
 	fmt.Printf("Task:   %s\n\n", task)
 
 	// Check if the worker role has a pool configured.
@@ -334,12 +343,17 @@ func cmdRunSingle(ctx context.Context, router *provider.Router, task, supervisor
 // cmdModels implements the "et models" subcommand.
 func cmdModels(args []string) error {
 	fs := flag.NewFlagSet("models", flag.ExitOnError)
-	configPath := fs.String("config", "electrictown.yaml", "path to config file")
+	configPath := fs.String("config", "", "path to config file (default: ./electrictown.yaml, then $HOME/electrictown.yaml)")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
 
-	cfg, err := provider.LoadConfig(*configPath)
+	resolvedConfig, err := findConfig(*configPath)
+	if err != nil {
+		return err
+	}
+
+	cfg, err := provider.LoadConfig(resolvedConfig)
 	if err != nil {
 		return fmt.Errorf("loading config: %w", err)
 	}
@@ -370,6 +384,45 @@ func cmdModels(args []string) error {
 	}
 
 	return nil
+}
+
+// friendlyError rewrites known raw error messages into actionable plain-text hints.
+func friendlyError(err error) string {
+	msg := err.Error()
+	switch {
+	case strings.Contains(msg, "connection refused"):
+		return msg + "\n  hint: the target host is not reachable — check that the Ollama service is running and the base_url in your config is correct"
+	case strings.Contains(msg, "no such host"):
+		return msg + "\n  hint: hostname could not be resolved — verify the base_url in your config points to a reachable host"
+	case strings.Contains(msg, "context deadline exceeded") || strings.Contains(msg, "deadline exceeded"):
+		return msg + "\n  hint: the request timed out — the model may be loading or the host may be overloaded"
+	case strings.Contains(msg, "x-api-key") || strings.Contains(msg, "authentication") || strings.Contains(msg, "Unauthorized") || strings.Contains(msg, "unauthorized"):
+		return msg + "\n  hint: check that your API key environment variable is exported in your shell"
+	default:
+		return msg
+	}
+}
+
+// findConfig resolves the config file path. If explicit is non-empty it is
+// returned as-is. Otherwise electrictown.yaml is searched in the current
+// directory first, then $HOME.
+func findConfig(explicit string) (string, error) {
+	const name = "electrictown.yaml"
+	if explicit != "" {
+		return explicit, nil
+	}
+	if _, err := os.Stat(name); err == nil {
+		return name, nil
+	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "", fmt.Errorf("no config specified and cannot determine home directory: %w", err)
+	}
+	p := filepath.Join(home, name)
+	if _, err := os.Stat(p); err == nil {
+		return p, nil
+	}
+	return "", fmt.Errorf("no config file found; tried ./%s and %s — use --config to specify a path", name, p)
 }
 
 func truncate(s string, maxLen int) string {

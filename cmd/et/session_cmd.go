@@ -68,7 +68,7 @@ func cmdSessionSpawn(args []string) error {
 	fs := flag.NewFlagSet("session spawn", flag.ExitOnError)
 	role := fs.String("role", "polecat", "agent role name")
 	workDir := fs.String("dir", ".", "working directory")
-	configPath := fs.String("config", "electrictown.yaml", "path to config file")
+	configPath := fs.String("config", "", "path to config file (default: ./electrictown.yaml, then $HOME/electrictown.yaml)")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -78,8 +78,12 @@ func cmdSessionSpawn(args []string) error {
 		return fmt.Errorf("prompt required\n\nUsage: et session spawn [--role name] [--dir path] \"prompt\"")
 	}
 
-	// Load config to build the command via the adapter.
-	cfg, err := provider.LoadConfig(*configPath)
+	// Resolve config path then load.
+	resolvedConfig, err := findConfig(*configPath)
+	if err != nil {
+		return err
+	}
+	cfg, err := provider.LoadConfig(resolvedConfig)
 	if err != nil {
 		return fmt.Errorf("loading config: %w", err)
 	}
@@ -158,8 +162,13 @@ func cmdSessionAttach(args []string) error {
 
 	name := args[0]
 
-	// Use exec.Command directly to attach (needs interactive terminal).
-	cmd := exec.Command("tmux", "attach-session", "-t", name)
+	// Prefer byobu when available so the user gets byobu decorations on attach.
+	binary := "tmux"
+	if tmux.DetectByobu() {
+		binary = "byobu"
+	}
+
+	cmd := exec.Command(binary, "attach-session", "-t", name)
 	cmd.Stdin = os.Stdin
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
