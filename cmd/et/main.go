@@ -174,23 +174,35 @@ func cmdRun(args []string) error {
 		return fmt.Errorf("creating router: %w", err)
 	}
 
+	// Build the per-run log directory: {log_dir}/{YYYY-MM-DD}_{shortID}.
+	baseLogDir, err := cfg.ResolveLogDir()
+	if err != nil {
+		return fmt.Errorf("resolving log_dir: %w", err)
+	}
+	runID, err := generateShortID()
+	if err != nil {
+		return fmt.Errorf("generating run ID: %w", err)
+	}
+	runLogDir := filepath.Join(baseLogDir, time.Now().Format("2006-01-02")+"_"+runID)
+
 	fmt.Printf("electrictown %s\n", version)
 	fmt.Printf("============\n")
 	fmt.Printf("Config: %s\n", resolvedConfig)
-	fmt.Printf("Task:   %s\n\n", task)
+	fmt.Printf("Task:   %s\n", task)
+	fmt.Printf("Logs:   %s\n\n", runLogDir)
 
 	// Check if the worker role has a pool configured.
 	poolAliases := cfg.PoolForRole(workerRole)
 	if len(poolAliases) > 0 {
-		return cmdRunParallel(ctx, router, cfg, task, *supervisorRole, poolAliases, *noSynthesize, *maxSubtasks, *outputDir)
+		return cmdRunParallel(ctx, router, cfg, task, *supervisorRole, poolAliases, *noSynthesize, *maxSubtasks, *outputDir, runLogDir)
 	}
 
 	// Legacy single-worker flow (no pool configured).
-	return cmdRunSingle(ctx, router, task, *supervisorRole, workerRole, *outputDir)
+	return cmdRunSingle(ctx, router, task, *supervisorRole, workerRole, *outputDir, runLogDir)
 }
 
 // cmdRunParallel implements the three-phase pipeline: decompose → parallel execute → synthesize.
-func cmdRunParallel(ctx context.Context, router *provider.Router, cfg *provider.Config, task, supervisorRole string, poolAliases []string, noSynthesize bool, maxSubtasks int, outputDir string) error {
+func cmdRunParallel(ctx context.Context, router *provider.Router, cfg *provider.Config, task, supervisorRole string, poolAliases []string, noSynthesize bool, maxSubtasks int, outputDir, runLogDir string) error {
 	// Build Mayor with options.
 	var mayorOpts []role.MayorOption
 	mayorOpts = append(mayorOpts, role.WithMayorRole(supervisorRole))
@@ -236,16 +248,21 @@ func cmdRunParallel(ctx context.Context, router *provider.Router, cfg *provider.
 		for i, r := range results {
 			fmt.Printf("--- Worker %d (%s: subtask %d) ---\n", i+1, r.Role, i+1)
 			fmt.Println(r.Response)
-			if outputDir != "" {
-				filename, content := parseWorkerOutput(r.Response)
-				if filename == "" {
-					filename = fmt.Sprintf("worker-%d.out", i+1)
-					content = r.Response
-				}
+			filename, content := parseWorkerOutput(r.Response)
+			if filename != "" && outputDir != "" {
+				// Named file → output dir.
 				if err := writeOutputFile(outputDir, filename, content); err != nil {
 					fmt.Fprintf(os.Stderr, "  warning: could not write %s: %v\n", filename, err)
 				} else {
 					fmt.Printf("  → wrote %s\n", filepath.Join(outputDir, filename))
+				}
+			} else {
+				// Unnamed output → log dir.
+				logFile := fmt.Sprintf("worker-%d.out", i+1)
+				if err := writeOutputFile(runLogDir, logFile, r.Response); err != nil {
+					fmt.Fprintf(os.Stderr, "  warning: could not write log %s: %v\n", logFile, err)
+				} else {
+					fmt.Printf("  → logged %s\n", filepath.Join(runLogDir, logFile))
 				}
 			}
 		}
@@ -262,32 +279,37 @@ func cmdRunParallel(ctx context.Context, router *provider.Router, cfg *provider.
 	fmt.Println(synthesis)
 	fmt.Printf("--------------------\n")
 
-	// Write worker files and synthesis when output-dir is set.
-	if outputDir != "" {
-		for i, r := range results {
-			filename, content := parseWorkerOutput(r.Response)
-			if filename == "" {
-				filename = fmt.Sprintf("worker-%d.out", i+1)
-				content = r.Response
-			}
+	// Write code files to output-dir; logs and synthesis to run log dir.
+	for i, r := range results {
+		filename, content := parseWorkerOutput(r.Response)
+		if filename != "" && outputDir != "" {
+			// Named file → output dir.
 			if err := writeOutputFile(outputDir, filename, content); err != nil {
 				fmt.Fprintf(os.Stderr, "  warning: could not write %s: %v\n", filename, err)
 			} else {
 				fmt.Printf("  → wrote %s\n", filepath.Join(outputDir, filename))
 			}
-		}
-		if err := writeOutputFile(outputDir, "_synthesis.md", synthesis); err != nil {
-			fmt.Fprintf(os.Stderr, "  warning: could not write _synthesis.md: %v\n", err)
 		} else {
-			fmt.Printf("  → wrote %s\n", filepath.Join(outputDir, "_synthesis.md"))
+			// Unnamed output → log dir.
+			logFile := fmt.Sprintf("worker-%d.out", i+1)
+			if err := writeOutputFile(runLogDir, logFile, r.Response); err != nil {
+				fmt.Fprintf(os.Stderr, "  warning: could not write log %s: %v\n", logFile, err)
+			} else {
+				fmt.Printf("  → logged %s\n", filepath.Join(runLogDir, logFile))
+			}
 		}
+	}
+	if err := writeOutputFile(runLogDir, "_synthesis.md", synthesis); err != nil {
+		fmt.Fprintf(os.Stderr, "  warning: could not write _synthesis.md: %v\n", err)
+	} else {
+		fmt.Printf("  → logged %s\n", filepath.Join(runLogDir, "_synthesis.md"))
 	}
 
 	return nil
 }
 
 // cmdRunSingle implements the legacy single-worker streaming flow.
-func cmdRunSingle(ctx context.Context, router *provider.Router, task, supervisorRole, workerRole, outputDir string) error {
+func cmdRunSingle(ctx context.Context, router *provider.Router, task, supervisorRole, workerRole, outputDir, runLogDir string) error {
 	// Phase 1: Supervisor generates subtask via ChatCompletion.
 	fmt.Printf("Phase 1: Supervisor (%s) analyzing task...\n", supervisorRole)
 
@@ -369,18 +391,20 @@ func cmdRunSingle(ctx context.Context, router *provider.Router, task, supervisor
 		fmt.Printf("\n---------------------\n")
 	}
 
-	// Write output file when output-dir is set.
-	if outputDir != "" {
-		content := totalContent.String()
-		filename, fileContent := parseWorkerOutput(content)
-		if filename == "" {
-			filename = "output.txt"
-			fileContent = content
-		}
+	// Write output: named file → output-dir; unnamed → log dir.
+	content := totalContent.String()
+	filename, fileContent := parseWorkerOutput(content)
+	if filename != "" && outputDir != "" {
 		if err := writeOutputFile(outputDir, filename, fileContent); err != nil {
 			fmt.Fprintf(os.Stderr, "  warning: could not write %s: %v\n", filename, err)
 		} else {
 			fmt.Printf("  → wrote %s\n", filepath.Join(outputDir, filename))
+		}
+	} else {
+		if err := writeOutputFile(runLogDir, "output.txt", content); err != nil {
+			fmt.Fprintf(os.Stderr, "  warning: could not write log output.txt: %v\n", err)
+		} else {
+			fmt.Printf("  → logged %s\n", filepath.Join(runLogDir, "output.txt"))
 		}
 	}
 
