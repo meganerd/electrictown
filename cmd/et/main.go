@@ -172,7 +172,7 @@ func cmdRun(args []string) error {
 		return fmt.Errorf("creating router: %w", err)
 	}
 
-	fmt.Printf("electrictown\n")
+	fmt.Printf("electrictown %s\n", version)
 	fmt.Printf("============\n")
 	fmt.Printf("Config: %s\n", resolvedConfig)
 	fmt.Printf("Task:   %s\n\n", task)

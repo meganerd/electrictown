@@ -97,14 +97,15 @@ func cmdSessionSpawn(args []string) error {
 	}
 	sessCfg.WorkDir = *workDir
 
-	// Build the command, wrapped in a shell so the session stays open after
-	// the command finishes (success or failure) and output remains readable.
+	// Build the shell-quoted command to send into the session.
+	// Using send-keys avoids all shell quoting issues with arbitrary prompt text.
 	cmdName, cmdArgs := adapter.BuildCommand(sessCfg, prompt)
-	innerCmd := cmdName
-	if len(cmdArgs) > 0 {
-		innerCmd = cmdName + " " + strings.Join(cmdArgs, " ")
+	parts := make([]string, 0, 1+len(cmdArgs))
+	parts = append(parts, cmdName)
+	for _, arg := range cmdArgs {
+		parts = append(parts, shellQuote(arg))
 	}
-	fullCmd := fmt.Sprintf("bash -c '%s; echo; echo \"--- session complete (exit $?) ---\"; exec bash'", innerCmd)
+	innerCmd := strings.Join(parts, " ")
 
 	// Generate session name.
 	runner := tmux.NewAutoRunner()
@@ -114,9 +115,14 @@ func cmdSessionSpawn(args []string) error {
 	}
 	sessionName := fmt.Sprintf("et-%s-%s", *role, shortID)
 
-	// Create the tmux session.
-	if err := runner.NewSession(sessionName, fullCmd, *workDir); err != nil {
+	// Start the session with a plain bash shell (stays alive after command completes).
+	if err := runner.NewSession(sessionName, "bash", *workDir); err != nil {
 		return fmt.Errorf("create tmux session: %w", err)
+	}
+
+	// Send the et run command into the shell.
+	if err := runner.SendKeys(sessionName, innerCmd); err != nil {
+		return fmt.Errorf("send command to session: %w", err)
 	}
 
 	fmt.Printf("Created session: %s\n", sessionName)
@@ -211,6 +217,11 @@ func cmdSessionSend(args []string) error {
 
 	fmt.Printf("Sent to %s: %s\n", name, truncate(text, 80))
 	return nil
+}
+
+// shellQuote wraps s in single quotes, escaping any single quotes within.
+func shellQuote(s string) string {
+	return "'" + strings.ReplaceAll(s, "'", "'\\''") + "'"
 }
 
 // generateShortID produces a 4-character hex string for session naming.
