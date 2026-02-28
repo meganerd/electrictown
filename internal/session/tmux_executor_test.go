@@ -226,7 +226,7 @@ func TestTmuxExecutor_SessionNaming(t *testing.T) {
 		{"abcdef1234567890", "polecat", "et-polecat-abcd"},
 		{"1234567890abcdef", "mayor", "et-mayor-1234"},
 		{"ff00", "crew", "et-crew-ff00"},
-		{"ab", "witness", "et-witness-ab"},
+		{"ab", "reviewer", "et-reviewer-ab"},
 	}
 
 	for _, tt := range tests {

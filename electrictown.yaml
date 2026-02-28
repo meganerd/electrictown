@@ -56,10 +56,10 @@ roles:
   crew:
     model: qwen-coder-local
 
-  witness:
+  reviewer:
     model: deepseek-local
 
-  refinery:
+  tester:
     model: claude-sonnet
 
 defaults:

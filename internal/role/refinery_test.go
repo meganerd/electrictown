@@ -12,7 +12,7 @@ import (
 
 // --- Refinery test helpers ---
 
-func refineryMockResponse() *provider.ChatResponse {
+func testerMockResponse() *provider.ChatResponse {
 	return &provider.ChatResponse{
 		ID:    "refine-001",
 		Model: "mock-model",
@@ -31,13 +31,13 @@ func refineryMockResponse() *provider.ChatResponse {
 
 // --- Constructor tests ---
 
-func TestNewRefinery_Defaults(t *testing.T) {
-	mp := &mockProvider{name: "test", response: refineryMockResponse()}
-	router := buildTestRouter(t, "refinery", mp)
+func TestNewTester_Defaults(t *testing.T) {
+	mp := &mockProvider{name: "test", response: testerMockResponse()}
+	router := buildTestRouter(t, "tester", mp)
 
-	r := NewRefinery(router)
+	r := NewTester(router)
 
-	if r.role != "refinery" {
+	if r.role != "tester" {
 		t.Errorf("expected default role 'refinery', got %q", r.role)
 	}
 	if r.router != router {
@@ -51,20 +51,20 @@ func TestNewRefinery_Defaults(t *testing.T) {
 	}
 }
 
-func TestNewRefinery_CustomOptions(t *testing.T) {
-	mp := &mockProvider{name: "test", response: refineryMockResponse()}
-	router := buildTestRouter(t, "custom-refinery", mp)
+func TestNewTester_CustomOptions(t *testing.T) {
+	mp := &mockProvider{name: "test", response: testerMockResponse()}
+	router := buildTestRouter(t, "custom-tester", mp)
 
 	customPrompt := "You are a Go code polisher."
 	tracker := cost.NewTracker(cost.DefaultPricing())
 
-	r := NewRefinery(router,
-		WithRefineryRole("custom-refinery"),
+	r := NewTester(router,
+		WithTesterRole("custom-tester"),
 		WithRefinerySystemPrompt(customPrompt),
 		WithRefineryCostTracker(tracker),
 	)
 
-	if r.role != "custom-refinery" {
+	if r.role != "custom-tester" {
 		t.Errorf("expected role 'custom-refinery', got %q", r.role)
 	}
 	if r.systemPrompt != customPrompt {
@@ -73,7 +73,7 @@ func TestNewRefinery_CustomOptions(t *testing.T) {
 	if r.tracker != tracker {
 		t.Error("expected tracker to be set")
 	}
-	if r.Role() != "custom-refinery" {
+	if r.Role() != "custom-tester" {
 		t.Errorf("Role() returned %q, expected 'custom-refinery'", r.Role())
 	}
 	if r.SystemPrompt() != customPrompt {
@@ -84,10 +84,10 @@ func TestNewRefinery_CustomOptions(t *testing.T) {
 // --- Refine tests ---
 
 func TestRefine_ReturnsResponseFromRouter(t *testing.T) {
-	mp := &mockProvider{name: "test", response: refineryMockResponse()}
-	router := buildTestRouter(t, "refinery", mp)
+	mp := &mockProvider{name: "test", response: testerMockResponse()}
+	router := buildTestRouter(t, "tester", mp)
 
-	r := NewRefinery(router)
+	r := NewTester(router)
 	resp, err := r.Refine(context.Background(), "func hello() { return \"hello\" }")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
@@ -113,11 +113,11 @@ func TestRefine_ReturnsResponseFromRouter(t *testing.T) {
 }
 
 func TestRefine_RecordsCostWhenTrackerProvided(t *testing.T) {
-	mp := &mockProvider{name: "test", response: refineryMockResponse()}
-	router := buildTestRouter(t, "refinery", mp)
+	mp := &mockProvider{name: "test", response: testerMockResponse()}
+	router := buildTestRouter(t, "tester", mp)
 
 	tracker := cost.NewTracker(cost.DefaultPricing())
-	r := NewRefinery(router, WithRefineryCostTracker(tracker))
+	r := NewTester(router, WithRefineryCostTracker(tracker))
 
 	_, err := r.Refine(context.Background(), "some code")
 	if err != nil {
@@ -129,7 +129,7 @@ func TestRefine_RecordsCostWhenTrackerProvided(t *testing.T) {
 		t.Fatalf("expected 1 cost record, got %d", len(records))
 	}
 	rec := records[0]
-	if rec.Role != "refinery" {
+	if rec.Role != "tester" {
 		t.Errorf("expected cost record role 'refinery', got %q", rec.Role)
 	}
 	if rec.Model != "mock-model" {
@@ -144,10 +144,10 @@ func TestRefine_RecordsCostWhenTrackerProvided(t *testing.T) {
 }
 
 func TestRefine_WithoutTrackerDoesNotPanic(t *testing.T) {
-	mp := &mockProvider{name: "test", response: refineryMockResponse()}
-	router := buildTestRouter(t, "refinery", mp)
+	mp := &mockProvider{name: "test", response: testerMockResponse()}
+	router := buildTestRouter(t, "tester", mp)
 
-	r := NewRefinery(router) // no tracker
+	r := NewTester(router) // no tracker
 
 	resp, err := r.Refine(context.Background(), "some code")
 	if err != nil {
@@ -161,10 +161,10 @@ func TestRefine_WithoutTrackerDoesNotPanic(t *testing.T) {
 // --- RefineWithFeedback tests ---
 
 func TestRefineWithFeedback_IncludesInputAndFeedback(t *testing.T) {
-	mp := &mockProvider{name: "test", response: refineryMockResponse()}
-	router := buildTestRouter(t, "refinery", mp)
+	mp := &mockProvider{name: "test", response: testerMockResponse()}
+	router := buildTestRouter(t, "tester", mp)
 
-	r := NewRefinery(router)
+	r := NewTester(router)
 	resp, err := r.RefineWithFeedback(context.Background(), "func foo() {}", "improve error handling")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
@@ -192,10 +192,10 @@ func TestRefineWithFeedback_IncludesInputAndFeedback(t *testing.T) {
 // --- Summarize tests ---
 
 func TestSummarize_PassesContentToModel(t *testing.T) {
-	mp := &mockProvider{name: "test", response: refineryMockResponse()}
-	router := buildTestRouter(t, "refinery", mp)
+	mp := &mockProvider{name: "test", response: testerMockResponse()}
+	router := buildTestRouter(t, "tester", mp)
 
-	r := NewRefinery(router)
+	r := NewTester(router)
 	resp, err := r.Summarize(context.Background(), "a very long piece of content that needs summarizing")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
@@ -219,9 +219,9 @@ func TestSummarize_PassesContentToModel(t *testing.T) {
 func TestRefine_PropagatesRouterErrors(t *testing.T) {
 	expectedErr := fmt.Errorf("provider unavailable")
 	mp := &mockProvider{name: "test", err: expectedErr}
-	router := buildTestRouter(t, "refinery", mp)
+	router := buildTestRouter(t, "tester", mp)
 
-	r := NewRefinery(router)
+	r := NewTester(router)
 	_, err := r.Refine(context.Background(), "some code")
 	if err == nil {
 		t.Fatal("expected error, got nil")
@@ -234,10 +234,10 @@ func TestRefine_PropagatesRouterErrors(t *testing.T) {
 // --- System prompt tests ---
 
 func TestDefaultRefinerySystemPrompt_Content(t *testing.T) {
-	mp := &mockProvider{name: "test", response: refineryMockResponse()}
-	router := buildTestRouter(t, "refinery", mp)
+	mp := &mockProvider{name: "test", response: testerMockResponse()}
+	router := buildTestRouter(t, "tester", mp)
 
-	r := NewRefinery(router)
+	r := NewTester(router)
 	prompt := r.SystemPrompt()
 
 	if prompt == "" {

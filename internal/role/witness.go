@@ -8,7 +8,7 @@ import (
 	"github.com/meganerd/electrictown/internal/provider"
 )
 
-const defaultWitnessRole = "witness"
+const defaultReviewerRole = "reviewer"
 
 const defaultWitnessSystemPrompt = "You are a code reviewer. Analyze the provided code for correctness, " +
 	"security issues, performance problems, and adherence to best practices. " +
@@ -16,45 +16,45 @@ const defaultWitnessSystemPrompt = "You are a code reviewer. Analyze the provide
 
 // Witness represents a code reviewer/validator agent that reviews work output
 // for correctness, security issues, and quality. It is provider-agnostic --
-// it uses the router to talk to whatever model is configured for the "witness"
+// it uses the router to talk to whatever model is configured for the "reviewer"
 // role (or any custom reviewer role).
-type Witness struct {
+type Reviewer struct {
 	router       *provider.Router
 	tracker      *cost.Tracker // optional, nil-safe
-	role         string        // role name, defaults to "witness"
+	role         string        // role name, defaults to "reviewer"
 	systemPrompt string        // configurable system prompt
 }
 
 // WitnessOption configures a Witness during construction.
-type WitnessOption func(*Witness)
+type WitnessOption func(*Reviewer)
 
-// WithWitnessRole sets a custom role name for the witness reviewer.
+// WithReviewerRole sets a custom role name for the witness reviewer.
 // The role name determines which model config is used via the router.
-func WithWitnessRole(name string) WitnessOption {
-	return func(w *Witness) {
+func WithReviewerRole(name string) WitnessOption {
+	return func(w *Reviewer) {
 		w.role = name
 	}
 }
 
 // WithWitnessSystemPrompt overrides the default system prompt.
 func WithWitnessSystemPrompt(prompt string) WitnessOption {
-	return func(w *Witness) {
+	return func(w *Reviewer) {
 		w.systemPrompt = prompt
 	}
 }
 
 // WithWitnessCostTracker attaches a cost tracker for recording token usage.
 func WithWitnessCostTracker(t *cost.Tracker) WitnessOption {
-	return func(w *Witness) {
+	return func(w *Reviewer) {
 		w.tracker = t
 	}
 }
 
-// NewWitness creates a witness reviewer with the given router and options.
-func NewWitness(router *provider.Router, opts ...WitnessOption) *Witness {
-	w := &Witness{
+// NewReviewer creates a witness reviewer with the given router and options.
+func NewReviewer(router *provider.Router, opts ...WitnessOption) *Reviewer {
+	w := &Reviewer{
 		router:       router,
-		role:         defaultWitnessRole,
+		role:         defaultReviewerRole,
 		systemPrompt: defaultWitnessSystemPrompt,
 	}
 	for _, opt := range opts {
@@ -64,18 +64,18 @@ func NewWitness(router *provider.Router, opts ...WitnessOption) *Witness {
 }
 
 // SystemPrompt returns the current system prompt.
-func (w *Witness) SystemPrompt() string {
+func (w *Reviewer) SystemPrompt() string {
 	return w.systemPrompt
 }
 
 // Role returns the witness's configured role name.
-func (w *Witness) Role() string {
+func (w *Reviewer) Role() string {
 	return w.role
 }
 
 // Review sends code to the reviewer's configured model for analysis and returns
 // the full review response. The system prompt is automatically prepended.
-func (w *Witness) Review(ctx context.Context, code string) (*provider.ChatResponse, error) {
+func (w *Reviewer) Review(ctx context.Context, code string) (*provider.ChatResponse, error) {
 	messages := []provider.Message{
 		{Role: provider.RoleSystem, Content: w.systemPrompt},
 		{Role: provider.RoleUser, Content: fmt.Sprintf("Review the following code:\n\n%s", code)},
@@ -96,7 +96,7 @@ func (w *Witness) Review(ctx context.Context, code string) (*provider.ChatRespon
 
 // ReviewWithContext reviews code with the original task context, allowing the
 // reviewer to assess whether the implementation correctly addresses the task.
-func (w *Witness) ReviewWithContext(ctx context.Context, task string, code string) (*provider.ChatResponse, error) {
+func (w *Reviewer) ReviewWithContext(ctx context.Context, task string, code string) (*provider.ChatResponse, error) {
 	messages := []provider.Message{
 		{Role: provider.RoleSystem, Content: w.systemPrompt},
 		{Role: provider.RoleUser, Content: fmt.Sprintf("Original task:\n%s\n\nCode to review:\n%s", task, code)},
@@ -117,7 +117,7 @@ func (w *Witness) ReviewWithContext(ctx context.Context, task string, code strin
 
 // Validate checks output against acceptance criteria, determining whether the
 // output meets the specified requirements.
-func (w *Witness) Validate(ctx context.Context, criteria string, output string) (*provider.ChatResponse, error) {
+func (w *Reviewer) Validate(ctx context.Context, criteria string, output string) (*provider.ChatResponse, error) {
 	messages := []provider.Message{
 		{Role: provider.RoleSystem, Content: w.systemPrompt},
 		{Role: provider.RoleUser, Content: fmt.Sprintf("Acceptance criteria:\n%s\n\nOutput to validate:\n%s", criteria, output)},
@@ -138,7 +138,7 @@ func (w *Witness) Validate(ctx context.Context, criteria string, output string) 
 
 // recordCost records token usage if a cost tracker is attached.
 // Safe to call when tracker is nil.
-func (w *Witness) recordCost(resp *provider.ChatResponse) {
+func (w *Reviewer) recordCost(resp *provider.ChatResponse) {
 	if w.tracker == nil || resp == nil {
 		return
 	}

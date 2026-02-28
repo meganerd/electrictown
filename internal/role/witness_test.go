@@ -31,13 +31,13 @@ func defaultWitnessMockResponse() *provider.ChatResponse {
 
 // --- Constructor tests ---
 
-func TestNewWitness_Defaults(t *testing.T) {
+func TestNewReviewer_Defaults(t *testing.T) {
 	mp := &mockProvider{name: "test", response: defaultWitnessMockResponse()}
-	router := buildTestRouter(t, "witness", mp)
+	router := buildTestRouter(t, "reviewer", mp)
 
-	w := NewWitness(router)
+	w := NewReviewer(router)
 
-	if w.role != "witness" {
+	if w.role != "reviewer" {
 		t.Errorf("expected default role 'witness', got %q", w.role)
 	}
 	if w.router != router {
@@ -51,13 +51,13 @@ func TestNewWitness_Defaults(t *testing.T) {
 	}
 }
 
-func TestNewWitness_CustomOptions(t *testing.T) {
+func TestNewReviewer_CustomOptions(t *testing.T) {
 	mp := &mockProvider{name: "test", response: defaultWitnessMockResponse()}
 	router := buildTestRouter(t, "reviewer", mp)
 	tracker := cost.NewTracker(nil)
 
-	w := NewWitness(router,
-		WithWitnessRole("reviewer"),
+	w := NewReviewer(router,
+		WithReviewerRole("reviewer"),
 		WithWitnessSystemPrompt("custom reviewer prompt"),
 		WithWitnessCostTracker(tracker),
 	)
@@ -77,9 +77,9 @@ func TestNewWitness_CustomOptions(t *testing.T) {
 
 func TestReview_ReturnsResponseFromRouter(t *testing.T) {
 	mp := &mockProvider{name: "test", response: defaultWitnessMockResponse()}
-	router := buildTestRouter(t, "witness", mp)
+	router := buildTestRouter(t, "reviewer", mp)
 
-	w := NewWitness(router)
+	w := NewReviewer(router)
 	resp, err := w.Review(context.Background(), "func Hello() string { return \"hello\" }")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
@@ -109,10 +109,10 @@ func TestReview_ReturnsResponseFromRouter(t *testing.T) {
 
 func TestReview_RecordsCostWhenTrackerProvided(t *testing.T) {
 	mp := &mockProvider{name: "test", response: defaultWitnessMockResponse()}
-	router := buildTestRouter(t, "witness", mp)
+	router := buildTestRouter(t, "reviewer", mp)
 
 	tracker := cost.NewTracker(cost.DefaultPricing())
-	w := NewWitness(router, WithWitnessCostTracker(tracker))
+	w := NewReviewer(router, WithWitnessCostTracker(tracker))
 
 	_, err := w.Review(context.Background(), "some code")
 	if err != nil {
@@ -124,7 +124,7 @@ func TestReview_RecordsCostWhenTrackerProvided(t *testing.T) {
 		t.Fatalf("expected 1 cost record, got %d", len(records))
 	}
 	rec := records[0]
-	if rec.Role != "witness" {
+	if rec.Role != "reviewer" {
 		t.Errorf("expected cost record role 'witness', got %q", rec.Role)
 	}
 	if rec.Model != "mock-model" {
@@ -140,9 +140,9 @@ func TestReview_RecordsCostWhenTrackerProvided(t *testing.T) {
 
 func TestReview_WithoutTrackerDoesNotPanic(t *testing.T) {
 	mp := &mockProvider{name: "test", response: defaultWitnessMockResponse()}
-	router := buildTestRouter(t, "witness", mp)
+	router := buildTestRouter(t, "reviewer", mp)
 
-	w := NewWitness(router) // no tracker
+	w := NewReviewer(router) // no tracker
 
 	resp, err := w.Review(context.Background(), "some code")
 	if err != nil {
@@ -157,9 +157,9 @@ func TestReview_WithoutTrackerDoesNotPanic(t *testing.T) {
 
 func TestReviewWithContext_IncludesTaskAndCode(t *testing.T) {
 	mp := &mockProvider{name: "test", response: defaultWitnessMockResponse()}
-	router := buildTestRouter(t, "witness", mp)
+	router := buildTestRouter(t, "reviewer", mp)
 
-	w := NewWitness(router)
+	w := NewReviewer(router)
 	resp, err := w.ReviewWithContext(context.Background(), "implement a hello function", "func Hello() string { return \"hello\" }")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
@@ -188,9 +188,9 @@ func TestReviewWithContext_IncludesTaskAndCode(t *testing.T) {
 
 func TestValidate_PassesCriteriaAndOutput(t *testing.T) {
 	mp := &mockProvider{name: "test", response: defaultWitnessMockResponse()}
-	router := buildTestRouter(t, "witness", mp)
+	router := buildTestRouter(t, "reviewer", mp)
 
-	w := NewWitness(router)
+	w := NewReviewer(router)
 	resp, err := w.Validate(context.Background(), "must return a string", "func Hello() string { return \"hello\" }")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
@@ -220,9 +220,9 @@ func TestValidate_PassesCriteriaAndOutput(t *testing.T) {
 func TestReview_PropagatesRouterErrors(t *testing.T) {
 	expectedErr := fmt.Errorf("provider unavailable")
 	mp := &mockProvider{name: "test", err: expectedErr}
-	router := buildTestRouter(t, "witness", mp)
+	router := buildTestRouter(t, "reviewer", mp)
 
-	w := NewWitness(router)
+	w := NewReviewer(router)
 	_, err := w.Review(context.Background(), "some code")
 	if err == nil {
 		t.Fatal("expected error, got nil")
@@ -236,9 +236,9 @@ func TestReview_PropagatesRouterErrors(t *testing.T) {
 
 func TestDefaultWitnessSystemPrompt_Content(t *testing.T) {
 	mp := &mockProvider{name: "test", response: defaultWitnessMockResponse()}
-	router := buildTestRouter(t, "witness", mp)
+	router := buildTestRouter(t, "reviewer", mp)
 
-	w := NewWitness(router)
+	w := NewReviewer(router)
 	prompt := w.SystemPrompt()
 
 	if prompt == "" {

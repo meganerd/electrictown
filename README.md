@@ -169,10 +169,10 @@ roles:
       - qwen-coder-cloud                     # cloud fallback
     fallbacks: [qwen-coder-cloud]          # fall back to cloud if local is down
 
-  witness:
+  reviewer:
     model: gpt4o
 
-  refinery:
+  tester:
     model: claude-sonnet
 
 # Defaults -- used when a role has no explicit config
@@ -340,7 +340,7 @@ stream, err := polecat.ExecuteStream(ctx, "implement merge sort")
 The Witness reviews code for correctness, security, and quality. It can review standalone code, review code against the original task, or validate output against acceptance criteria.
 
 ```go
-witness := role.NewWitness(router,
+witness := role.NewReviewer(router,
     role.WithWitnessCostTracker(tracker),
 )
 review, err := witness.Review(ctx, code)
@@ -353,7 +353,7 @@ validation, err := witness.Validate(ctx, criteria, output)
 The Refinery improves code quality -- fixing bugs, improving naming, adding error handling, and ensuring consistent style. It can refine with or without specific feedback, and can produce summaries.
 
 ```go
-refinery := role.NewRefinery(router,
+refinery := role.NewTester(router,
     role.WithRefineryCostTracker(tracker),
 )
 refined, err := refinery.Refine(ctx, rawCode)

@@ -83,9 +83,10 @@ func ParseConfig(data []byte) (*Config, error) {
 		if len(p.APIKey) > 0 && p.APIKey[0] == '$' {
 			varName := p.APIKey[1:]
 			p.APIKey = os.Getenv(varName)
-			// Only fail if auth actually requires a key (bearer or basic).
-			// Ollama and other providers with no auth_type treat an empty key as unauthenticated.
-			if p.APIKey == "" && (p.AuthType == AuthBearer || p.AuthType == AuthBasic) {
+			// Fail early for bearer auth with an unset env var — the request will
+			// always be rejected without it. Basic auth defers validation to runtime
+			// (colon format can't be checked until the value is actually resolved).
+			if p.APIKey == "" && p.AuthType == AuthBearer {
 				return nil, fmt.Errorf("provider %q requires an API key but $%s is not set or is empty", name, varName)
 			}
 			cfg.Providers[name] = p
