@@ -97,12 +97,14 @@ func cmdSessionSpawn(args []string) error {
 	}
 	sessCfg.WorkDir = *workDir
 
-	// Build the command.
+	// Build the command, wrapped in a shell so the session stays open after
+	// the command finishes (success or failure) and output remains readable.
 	cmdName, cmdArgs := adapter.BuildCommand(sessCfg, prompt)
-	fullCmd := cmdName
+	innerCmd := cmdName
 	if len(cmdArgs) > 0 {
-		fullCmd = cmdName + " " + strings.Join(cmdArgs, " ")
+		innerCmd = cmdName + " " + strings.Join(cmdArgs, " ")
 	}
+	fullCmd := fmt.Sprintf("bash -c '%s; echo; echo \"--- session complete (exit $?) ---\"; exec bash'", innerCmd)
 
 	// Generate session name.
 	runner := tmux.NewAutoRunner()
