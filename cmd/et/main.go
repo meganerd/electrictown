@@ -15,6 +15,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"time"
 
@@ -248,23 +249,8 @@ func cmdRunParallel(ctx context.Context, router *provider.Router, cfg *provider.
 		for i, r := range results {
 			fmt.Printf("--- Worker %d (%s: subtask %d) ---\n", i+1, r.Role, i+1)
 			fmt.Println(r.Response)
-			filename, content := parseWorkerOutput(r.Response)
-			if filename != "" && outputDir != "" {
-				// Named file → output dir.
-				if err := writeOutputFile(outputDir, filename, content); err != nil {
-					fmt.Fprintf(os.Stderr, "  warning: could not write %s: %v\n", filename, err)
-				} else {
-					fmt.Printf("  → wrote %s\n", filepath.Join(outputDir, filename))
-				}
-			} else {
-				// Unnamed output → log dir.
-				logFile := fmt.Sprintf("worker-%d.out", i+1)
-				if err := writeOutputFile(runLogDir, logFile, r.Response); err != nil {
-					fmt.Fprintf(os.Stderr, "  warning: could not write log %s: %v\n", logFile, err)
-				} else {
-					fmt.Printf("  → logged %s\n", filepath.Join(runLogDir, logFile))
-				}
-			}
+			files := parseMultiFileOutput(r.Response)
+			writeWorkerFiles(files, i, outputDir, runLogDir)
 		}
 		return nil
 	}
@@ -281,23 +267,8 @@ func cmdRunParallel(ctx context.Context, router *provider.Router, cfg *provider.
 
 	// Write code files to output-dir; logs and synthesis to run log dir.
 	for i, r := range results {
-		filename, content := parseWorkerOutput(r.Response)
-		if filename != "" && outputDir != "" {
-			// Named file → output dir.
-			if err := writeOutputFile(outputDir, filename, content); err != nil {
-				fmt.Fprintf(os.Stderr, "  warning: could not write %s: %v\n", filename, err)
-			} else {
-				fmt.Printf("  → wrote %s\n", filepath.Join(outputDir, filename))
-			}
-		} else {
-			// Unnamed output → log dir.
-			logFile := fmt.Sprintf("worker-%d.out", i+1)
-			if err := writeOutputFile(runLogDir, logFile, r.Response); err != nil {
-				fmt.Fprintf(os.Stderr, "  warning: could not write log %s: %v\n", logFile, err)
-			} else {
-				fmt.Printf("  → logged %s\n", filepath.Join(runLogDir, logFile))
-			}
-		}
+		files := parseMultiFileOutput(r.Response)
+		writeWorkerFiles(files, i, outputDir, runLogDir)
 	}
 	if err := writeOutputFile(runLogDir, "_synthesis.md", synthesis); err != nil {
 		fmt.Fprintf(os.Stderr, "  warning: could not write _synthesis.md: %v\n", err)
@@ -391,22 +362,9 @@ func cmdRunSingle(ctx context.Context, router *provider.Router, task, supervisor
 		fmt.Printf("\n---------------------\n")
 	}
 
-	// Write output: named file → output-dir; unnamed → log dir.
-	content := totalContent.String()
-	filename, fileContent := parseWorkerOutput(content)
-	if filename != "" && outputDir != "" {
-		if err := writeOutputFile(outputDir, filename, fileContent); err != nil {
-			fmt.Fprintf(os.Stderr, "  warning: could not write %s: %v\n", filename, err)
-		} else {
-			fmt.Printf("  → wrote %s\n", filepath.Join(outputDir, filename))
-		}
-	} else {
-		if err := writeOutputFile(runLogDir, "output.txt", content); err != nil {
-			fmt.Fprintf(os.Stderr, "  warning: could not write log output.txt: %v\n", err)
-		} else {
-			fmt.Printf("  → logged %s\n", filepath.Join(runLogDir, "output.txt"))
-		}
-	}
+	// Write output: named files → output-dir; unnamed → log dir.
+	files := parseMultiFileOutput(totalContent.String())
+	writeWorkerFiles(files, 0, outputDir, runLogDir)
 
 	// Usage summary.
 	fmt.Printf("\nDone: supervisor→worker round-trip complete\n")
@@ -506,33 +464,90 @@ func truncate(s string, maxLen int) string {
 	return s[:maxLen-3] + "..."
 }
 
-// workerPrompt returns the system prompt for workers, adding a FILENAME: instruction
-// when outputDir is set so the LLM indicates which file its output belongs to.
+// FileOutput holds a single parsed file from a worker response.
+type FileOutput struct {
+	Name    string // relative path; empty means unnamed (goes to log dir)
+	Content string
+}
+
+// workerPrompt returns the system prompt for workers.
+// When outputDir is set, instructs multi-file output with ===FILE: === delimiters.
 func workerPrompt(outputDir string) string {
 	base := "You are a coding worker. Implement exactly what is asked."
 	if outputDir != "" {
-		return base + " Start your response with EXACTLY this line:\nFILENAME: relative/path/to/file\nThen output ONLY the file content — no explanations, no markdown fences unless the file format requires them."
+		return base + `
+
+Output all required source files using this exact format — one block per file:
+
+===FILE: relative/path/to/file.go===
+<complete file content here>
+===ENDFILE===
+
+Rules:
+- Output ONLY file content — no explanations, no commentary.
+- Each file must be complete and standalone (proper package declaration, all imports).
+- Use relative paths from the project root.
+- You may output as many files as the subtask requires.`
 	}
-	return base + " Output ONLY the code -- no explanations, no markdown fences unless specifically requested."
+	return base + " Output ONLY the code — no explanations, no markdown fences unless specifically requested."
 }
 
-// parseWorkerOutput extracts a filename and content from a worker response that
-// begins with "FILENAME: path". Returns empty filename if the format is absent.
-func parseWorkerOutput(response string) (filename, content string) {
+// parseMultiFileOutput parses worker response into a slice of FileOutput.
+// Handles three formats (in priority order):
+//  1. Multi-file: ===FILE: path=== ... ===ENDFILE===
+//  2. Single-file legacy: FILENAME: path\n<content>
+//  3. Unnamed fallback: entire response as unnamed content
+func parseMultiFileOutput(response string) []FileOutput {
+	// Try multi-file format first.
+	if strings.Contains(response, "===FILE:") {
+		return parseMultiFileBlocks(response)
+	}
+
+	// Try legacy single-file FILENAME: header.
 	const prefix = "FILENAME: "
 	idx := strings.Index(response, "\n")
-	if idx < 0 {
-		return "", response
+	if idx >= 0 {
+		firstLine := strings.TrimSpace(response[:idx])
+		if strings.HasPrefix(firstLine, prefix) {
+			name := strings.TrimPrefix(firstLine, prefix)
+			name = strings.TrimPrefix(strings.TrimSpace(name), "/")
+			return []FileOutput{{Name: name, Content: response[idx+1:]}}
+		}
 	}
-	firstLine := strings.TrimSpace(response[:idx])
-	if !strings.HasPrefix(firstLine, prefix) {
-		return "", response
+
+	// Unnamed fallback.
+	return []FileOutput{{Name: "", Content: response}}
+}
+
+// fileBlockPattern matches ===FILE: path=== ... ===ENDFILE=== blocks.
+var fileBlockPattern = regexp.MustCompile(`(?s)===FILE:\s*([^\n=]+?)===\s*\n(.*?)(?:===ENDFILE===|(?:===FILE:))`)
+
+func parseMultiFileBlocks(response string) []FileOutput {
+	// Append a sentinel so the last block is caught by the non-lookahead pattern.
+	text := response + "\n===FILE: __sentinel__==="
+	matches := fileBlockPattern.FindAllStringSubmatch(text, -1)
+	if len(matches) == 0 {
+		return []FileOutput{{Name: "", Content: response}}
 	}
-	filename = strings.TrimSpace(strings.TrimPrefix(firstLine, prefix))
-	// Strip leading slash to ensure relative path.
-	filename = strings.TrimPrefix(filename, "/")
-	content = response[idx+1:]
-	return filename, content
+	files := make([]FileOutput, 0, len(matches))
+	for _, m := range matches {
+		name := strings.TrimSpace(m[1])
+		if name == "__sentinel__" {
+			continue
+		}
+		name = strings.TrimPrefix(name, "/")
+		content := strings.TrimLeft(m[2], "\n")
+		// Strip trailing ===ENDFILE=== if present.
+		content = strings.TrimSuffix(strings.TrimRight(content, "\n\r\t "), "===ENDFILE===")
+		content = strings.TrimRight(content, "\n\r\t ")
+		if name != "" {
+			files = append(files, FileOutput{Name: name, Content: content})
+		}
+	}
+	if len(files) == 0 {
+		return []FileOutput{{Name: "", Content: response}}
+	}
+	return files
 }
 
 // writeOutputFile writes content to path/filename, creating parent directories.
@@ -542,4 +557,33 @@ func writeOutputFile(dir, filename, content string) error {
 		return fmt.Errorf("create directories for %s: %w", fullPath, err)
 	}
 	return os.WriteFile(fullPath, []byte(content), 0644)
+}
+
+// writeWorkerFiles writes parsed file outputs from a single worker.
+// Named files go to outputDir (when set); unnamed fallback goes to logDir as workerN.out.
+func writeWorkerFiles(files []FileOutput, workerIdx int, outputDir, logDir string) {
+	hasNamed := false
+	for _, f := range files {
+		if f.Name != "" && outputDir != "" {
+			if err := writeOutputFile(outputDir, f.Name, f.Content); err != nil {
+				fmt.Fprintf(os.Stderr, "  warning: could not write %s: %v\n", f.Name, err)
+			} else {
+				fmt.Printf("  → wrote %s\n", filepath.Join(outputDir, f.Name))
+				hasNamed = true
+			}
+		}
+	}
+	// If no named files were written (or outputDir unset), log the raw response.
+	if !hasNamed {
+		logFile := fmt.Sprintf("worker-%d.out", workerIdx+1)
+		raw := files[0].Content
+		if len(files) == 1 && files[0].Name == "" {
+			raw = files[0].Content
+		}
+		if err := writeOutputFile(logDir, logFile, raw); err != nil {
+			fmt.Fprintf(os.Stderr, "  warning: could not write log %s: %v\n", logFile, err)
+		} else {
+			fmt.Printf("  → logged %s\n", filepath.Join(logDir, logFile))
+		}
+	}
 }

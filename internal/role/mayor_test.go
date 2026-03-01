@@ -23,8 +23,8 @@ func TestNewMayor_Defaults(t *testing.T) {
 	if m.role != "mayor" {
 		t.Errorf("expected default role 'mayor', got %q", m.role)
 	}
-	if m.maxSubtasks != 5 {
-		t.Errorf("expected default maxSubtasks 5, got %d", m.maxSubtasks)
+	if m.maxSubtasks != 10 {
+		t.Errorf("expected default maxSubtasks 10, got %d", m.maxSubtasks)
 	}
 	if m.systemPrompt == "" {
 		t.Error("expected non-empty default system prompt")

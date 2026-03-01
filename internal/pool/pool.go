@@ -63,6 +63,10 @@ func (wp *WorkerPool) ExecuteAll(ctx context.Context, subtasks []string, systemP
 			}
 
 			resp, err := wp.router.ChatCompletion(ctx, req)
+			if err != nil {
+				// Retry once on transient failure.
+				resp, err = wp.router.ChatCompletion(ctx, req)
+			}
 
 			result := role.WorkerResult{
 				Role:    alias,

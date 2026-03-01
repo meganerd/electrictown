@@ -13,6 +13,9 @@ import (
 // listItemPattern matches numbered lists (1. or 1)), bullet lists (- or * or bullet char).
 var listItemPattern = regexp.MustCompile(`^\s*(?:\d+[.)]\s+|[-*]\s+|` + "\u2022" + `\s+)(.+)$`)
 
+// boldPattern strips **text** and *text* markdown emphasis.
+var boldPattern = regexp.MustCompile(`\*{1,2}([^*]+)\*{1,2}`)
+
 // PlanResult holds the output of a Mayor.Plan call: a summary and discrete subtasks.
 type PlanResult struct {
 	Summary  string
@@ -41,7 +44,15 @@ type Mayor struct {
 	maxSubtasks  int
 }
 
-const defaultMayorSystemPrompt = `You are a technical supervisor that decomposes complex tasks into discrete, actionable subtasks. Each subtask should be independently executable by a worker agent. Return subtasks as a numbered list. Be specific and concrete.`
+const defaultMayorSystemPrompt = `You are a software architect decomposing a task into implementation subtasks for parallel coding workers.
+
+RULES:
+- Each subtask is one functional module or component (e.g. "HTTP downloader package", "PostgreSQL schema and migration", "CLI entry point").
+- Each subtask must produce complete, working, compilable source code — not setup instructions.
+- Name the specific files and Go packages the worker should write.
+- Workers run in parallel and cannot see each other's output, so define any shared interfaces inline in the subtask description so workers agree on them.
+- Generate as many subtasks as the task genuinely requires (no artificial limit).
+- Output ONLY a numbered list of subtasks. No headings, no preamble, no prose.`
 
 // NewMayor creates a Mayor supervisor with the given router and options.
 func NewMayor(router *provider.Router, opts ...MayorOption) *Mayor {
@@ -49,7 +60,7 @@ func NewMayor(router *provider.Router, opts ...MayorOption) *Mayor {
 		router:       router,
 		role:         "mayor",
 		systemPrompt: defaultMayorSystemPrompt,
-		maxSubtasks:  5,
+		maxSubtasks:  10,
 	}
 	for _, opt := range opts {
 		opt(m)
@@ -181,6 +192,9 @@ func ParseSubtasks(text string) []string {
 		matches := listItemPattern.FindStringSubmatch(line)
 		if matches != nil && len(matches) > 1 {
 			item := strings.TrimSpace(matches[1])
+			// Strip **bold** and *italic* markdown emphasis.
+			item = boldPattern.ReplaceAllString(item, "$1")
+			item = strings.TrimSpace(item)
 			if item != "" {
 				subtasks = append(subtasks, item)
 			}
