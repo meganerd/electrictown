@@ -1,4 +1,4 @@
 # Build artifacts
-build/
+/build/
 dist/
 /et

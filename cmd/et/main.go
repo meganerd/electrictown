@@ -20,6 +20,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/meganerd/electrictown/internal/build"
 	"github.com/meganerd/electrictown/internal/cost"
 	"github.com/meganerd/electrictown/internal/pool"
 	"github.com/meganerd/electrictown/internal/provider"
@@ -89,14 +90,16 @@ Commands:
   version  Print version information
 
 Flags (run):
-  --config         Path to config file (default: ./electrictown.yaml, then $HOME/electrictown.yaml)
-  --role           Supervisor role name (default: mayor; worker always uses polecat)
-  --no-synthesize  Skip synthesis, print raw per-worker output (pool mode only)
-  --no-reviewer    Skip Phase 2.5 reviewer scoring of worker outputs
-  --no-tester      Skip Phase 4 tester polish of synthesized output
-  --max-subtasks   Max subtasks for decomposition (0 = Mayor default of 10)
-  --timeout        Total timeout in minutes for the entire run (default: 30)
-  --output-dir     Directory to write output files (default: stdout only)
+  --config          Path to config file (default: ./electrictown.yaml, then $HOME/electrictown.yaml)
+  --role            Supervisor role name (default: mayor; worker always uses polecat)
+  --no-synthesize   Skip synthesis, print raw per-worker output (pool mode only)
+  --no-reviewer     Skip Phase 2.5 reviewer scoring of worker outputs
+  --no-tester       Skip Phase 4 tester polish of synthesized output
+  --iterate         Enable Phase 5 iterative build/fix loop (requires --output-dir)
+  --max-iterations  Max build/fix iterations for --iterate (default: 3)
+  --max-subtasks    Max subtasks for decomposition (0 = Mayor default of 10)
+  --timeout         Total timeout in minutes for the entire run (default: 30)
+  --output-dir      Directory to write output files (default: stdout only)
 
 Flags (models, nodes):
   --config   Path to config file (default: ./electrictown.yaml, then $HOME/electrictown.yaml)
@@ -154,6 +157,8 @@ func cmdRun(args []string) error {
 	noSynthesize := fs.Bool("no-synthesize", false, "skip synthesis, print raw per-worker output")
 	noReviewer := fs.Bool("no-reviewer", false, "skip Phase 2.5 reviewer scoring of worker outputs")
 	noTester := fs.Bool("no-tester", false, "skip Phase 4 tester polish of synthesized output")
+	iterate := fs.Bool("iterate", false, "enable Phase 5 iterative build/fix loop (requires --output-dir)")
+	maxIterations := fs.Int("max-iterations", 3, "max build/fix iterations for --iterate (default: 3)")
 	maxSubtasks := fs.Int("max-subtasks", 0, "max subtasks (0 = use Mayor default of 10)")
 	timeoutMins := fs.Int("timeout", 30, "total timeout in minutes for the entire run")
 	outputDir := fs.String("output-dir", "", "directory to write output files (default: stdout only)")
@@ -208,7 +213,7 @@ func cmdRun(args []string) error {
 	// Check if the worker role has a pool configured.
 	poolAliases := cfg.PoolForRole(workerRole)
 	if len(poolAliases) > 0 {
-		return cmdRunParallel(ctx, router, cfg, task, *supervisorRole, poolAliases, *noSynthesize, *noReviewer, *noTester, *maxSubtasks, *outputDir, runLogDir)
+		return cmdRunParallel(ctx, router, cfg, task, *supervisorRole, poolAliases, *noSynthesize, *noReviewer, *noTester, *iterate, *maxIterations, *maxSubtasks, *outputDir, runLogDir)
 	}
 
 	// Legacy single-worker flow (no pool configured).
@@ -216,8 +221,10 @@ func cmdRun(args []string) error {
 }
 
 // cmdRunParallel implements the multi-phase pipeline:
-//  1. Decompose  2. Parallel workers  2.5. Reviewer (optional)  3. Synthesize  4. Tester (optional)
-func cmdRunParallel(ctx context.Context, router *provider.Router, cfg *provider.Config, task, supervisorRole string, poolAliases []string, noSynthesize, noReviewer, noTester bool, maxSubtasks int, outputDir, runLogDir string) error {
+//
+//	1. Decompose  2. Parallel workers  2.5. Reviewer (optional)  3. Synthesize
+//	4. Tester (optional)  5. Build/fix loop (optional, requires --iterate)
+func cmdRunParallel(ctx context.Context, router *provider.Router, cfg *provider.Config, task, supervisorRole string, poolAliases []string, noSynthesize, noReviewer, noTester, iterate bool, maxIterations, maxSubtasks int, outputDir, runLogDir string) error {
 	// Shared cost tracker for all roles in this run.
 	tracker := cost.NewTracker(cost.DefaultPricing())
 
@@ -300,12 +307,17 @@ func cmdRunParallel(ctx context.Context, router *provider.Router, cfg *provider.
 	}
 
 	// Phase 3: Synthesize (unless --no-synthesize).
+	// Collect file→worker map during output writing (used by Phase 5).
+	fileWorkerMap := make(map[string]int)
 	if noSynthesize {
 		for i, r := range results {
 			fmt.Printf("--- Worker %d (%s: subtask %d) ---\n", i+1, r.Role, i+1)
 			fmt.Println(r.Response)
 			files := parseMultiFileOutput(r.Response)
-			writeWorkerFiles(files, i, outputDir, runLogDir)
+			written := writeWorkerFiles(files, i, outputDir, runLogDir)
+			for f := range written {
+				fileWorkerMap[f] = i
+			}
 		}
 		return nil
 	}
@@ -345,12 +357,76 @@ func cmdRunParallel(ctx context.Context, router *provider.Router, cfg *provider.
 	// Write code files to output-dir; logs and synthesis to run log dir.
 	for i, r := range results {
 		files := parseMultiFileOutput(r.Response)
-		writeWorkerFiles(files, i, outputDir, runLogDir)
+		written := writeWorkerFiles(files, i, outputDir, runLogDir)
+		for f := range written {
+			fileWorkerMap[f] = i
+		}
 	}
 	if err := writeOutputFile(runLogDir, "_synthesis.md", synthesis); err != nil {
 		fmt.Fprintf(os.Stderr, "  warning: could not write _synthesis.md: %v\n", err)
 	} else {
 		fmt.Printf("  → logged %s\n", filepath.Join(runLogDir, "_synthesis.md"))
+	}
+
+	// Phase 5: Iterative build/fix loop (optional).
+	if iterate && outputDir != "" {
+		runner := build.DetectRunner(outputDir)
+		if runner == nil {
+			fmt.Fprintf(os.Stderr, "  note: no build system detected in %s — skipping Phase 5\n", outputDir)
+		} else {
+			fmt.Printf("Phase 5: Iterative build/fix loop (%s, max %d iterations)...\n", runner.Name(), maxIterations)
+			buildOK := false
+			for iter := 1; iter <= maxIterations; iter++ {
+				fmt.Printf("  [iter %d/%d] building...\n", iter, maxIterations)
+				stdout, stderr, buildErr := runner.Run(ctx, outputDir)
+				_ = stdout
+
+				// Log full build output.
+				logContent := "=== stdout ===\n" + stdout + "\n=== stderr ===\n" + stderr
+				if err := writeOutputFile(runLogDir, fmt.Sprintf("_build_iter%d.log", iter), logContent); err != nil {
+					fmt.Fprintf(os.Stderr, "  warning: could not write build log: %v\n", err)
+				}
+
+				if buildErr == nil {
+					fmt.Printf("  ✓ Build succeeded on iteration %d\n", iter)
+					buildOK = true
+					break
+				}
+
+				fmt.Printf("  ✗ Build failed:\n")
+				fmt.Println(build.ErrorSummary(stderr, 20))
+
+				if iter == maxIterations {
+					break
+				}
+
+				// Parse errors, attribute to workers, dispatch targeted fixes.
+				buildErrors := build.NormalizeErrorPaths(build.ParseBuildErrors(stderr), outputDir)
+				workerErrors := build.MapFilesToWorkers(buildErrors, fileWorkerMap)
+
+				if len(workerErrors) == 0 {
+					fmt.Fprintf(os.Stderr, "  could not attribute errors to workers — skipping fix dispatch\n")
+					break
+				}
+
+				fmt.Printf("  Dispatching fix subtasks to %d worker(s)...\n", len(workerErrors))
+				fixSubtasks := buildFixSubtasks(workerErrors, outputDir)
+
+				fixResults := wp.ExecuteAll(ctx, fixSubtasks, workerSystemPrompt)
+				for workerIdx, fixResult := range fixResults {
+					fixFiles := parseMultiFileOutput(fixResult.Response)
+					written := writeWorkerFiles(fixFiles, workerIdx, outputDir, runLogDir)
+					for f := range written {
+						fileWorkerMap[f] = workerIdx
+					}
+				}
+			}
+
+			if !buildOK {
+				fmt.Printf("  ✗ Max iterations reached — build still failing\n")
+			}
+			fmt.Println()
+		}
 	}
 
 	// Token summary by role.
@@ -737,29 +813,51 @@ func (lp *liveProgress) update(idx int, line string) {
 
 // writeWorkerFiles writes parsed file outputs from a single worker.
 // Named files go to outputDir (when set); unnamed fallback goes to logDir as workerN.out.
-func writeWorkerFiles(files []FileOutput, workerIdx int, outputDir, logDir string) {
-	hasNamed := false
+// Returns a map of written named file paths (relative) to confirm what was written.
+func writeWorkerFiles(files []FileOutput, workerIdx int, outputDir, logDir string) map[string]struct{} {
+	written := make(map[string]struct{})
 	for _, f := range files {
 		if f.Name != "" && outputDir != "" {
 			if err := writeOutputFile(outputDir, f.Name, f.Content); err != nil {
 				fmt.Fprintf(os.Stderr, "  warning: could not write %s: %v\n", f.Name, err)
 			} else {
 				fmt.Printf("  → wrote %s\n", filepath.Join(outputDir, f.Name))
-				hasNamed = true
+				written[f.Name] = struct{}{}
 			}
 		}
 	}
 	// If no named files were written (or outputDir unset), log the raw response.
-	if !hasNamed {
+	if len(written) == 0 {
 		logFile := fmt.Sprintf("worker-%d.out", workerIdx+1)
 		raw := files[0].Content
-		if len(files) == 1 && files[0].Name == "" {
-			raw = files[0].Content
-		}
 		if err := writeOutputFile(logDir, logFile, raw); err != nil {
 			fmt.Fprintf(os.Stderr, "  warning: could not write log %s: %v\n", logFile, err)
 		} else {
 			fmt.Printf("  → logged %s\n", filepath.Join(logDir, logFile))
 		}
 	}
+	return written
+}
+
+// buildFixSubtasks builds targeted fix subtask prompts for workers with build errors.
+// Each prompt includes the failing file's current content and the attributed errors.
+func buildFixSubtasks(workerErrors map[int][]build.BuildError, outputDir string) []string {
+	subtasks := make([]string, 0, len(workerErrors))
+	for _, errs := range workerErrors {
+		var sb strings.Builder
+		sb.WriteString("Your previous output had build errors. Fix ONLY the files listed below.\n\n")
+		for _, e := range errs {
+			sb.WriteString(fmt.Sprintf("File: %s\n", e.File))
+			content, readErr := os.ReadFile(filepath.Join(outputDir, e.File))
+			if readErr == nil {
+				sb.WriteString("Current content:\n```\n")
+				sb.Write(content)
+				sb.WriteString("\n```\n")
+			}
+			sb.WriteString(fmt.Sprintf("Build error (line %d): %s\n\n", e.Line, e.Message))
+		}
+		sb.WriteString("Output the corrected file(s) using ===FILE: path=== ... ===ENDFILE=== format.")
+		subtasks = append(subtasks, sb.String())
+	}
+	return subtasks
 }
