@@ -6,6 +6,7 @@ import (
 	"context"
 	"fmt"
 	"sync"
+	"time"
 
 	"github.com/meganerd/electrictown/internal/provider"
 	"github.com/meganerd/electrictown/internal/role"
@@ -14,9 +15,10 @@ import (
 // WorkerPool dispatches subtasks concurrently across a pool of model aliases.
 // It uses a Balancer for round-robin assignment and the Router for request routing.
 type WorkerPool struct {
-	router   *provider.Router
-	balancer *provider.Balancer
-	aliases  []string // pool model aliases
+	router     *provider.Router
+	balancer   *provider.Balancer
+	aliases    []string                           // pool model aliases
+	onComplete func(idx int, r role.WorkerResult) // optional per-worker completion hook
 }
 
 // New creates a WorkerPool with the given router, balancer, and pool model aliases.
@@ -26,6 +28,14 @@ func New(router *provider.Router, balancer *provider.Balancer, aliases []string)
 		balancer: balancer,
 		aliases:  aliases,
 	}
+}
+
+// SetProgressHook registers a callback invoked when each worker finishes.
+// The callback receives the subtask index and the completed WorkerResult.
+// Safe to call concurrently — the caller is responsible for synchronizing any
+// shared state accessed inside the hook.
+func (wp *WorkerPool) SetProgressHook(fn func(idx int, r role.WorkerResult)) {
+	wp.onComplete = fn
 }
 
 // ExecuteAll dispatches subtasks concurrently across pool members. Each subtask
@@ -62,15 +72,18 @@ func (wp *WorkerPool) ExecuteAll(ctx context.Context, subtasks []string, systemP
 				},
 			}
 
+			start := time.Now()
 			resp, err := wp.router.ChatCompletion(ctx, req)
 			if err != nil {
 				// Retry once on transient failure.
 				resp, err = wp.router.ChatCompletion(ctx, req)
 			}
+			elapsed := time.Since(start)
 
 			result := role.WorkerResult{
 				Role:    alias,
 				Subtask: task,
+				Elapsed: elapsed,
 			}
 			if err != nil {
 				result.Response = fmt.Sprintf("error: %v", err)
@@ -80,6 +93,10 @@ func (wp *WorkerPool) ExecuteAll(ctx context.Context, subtasks []string, systemP
 			}
 
 			results[idx] = result
+
+			if wp.onComplete != nil {
+				wp.onComplete(idx, result)
+			}
 		}(i, subtask)
 	}
 

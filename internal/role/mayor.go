@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"regexp"
 	"strings"
+	"time"
 
 	"github.com/meganerd/electrictown/internal/cost"
 	"github.com/meganerd/electrictown/internal/provider"
@@ -24,10 +25,14 @@ type PlanResult struct {
 
 // WorkerResult represents the output from a single worker (polecat) execution.
 type WorkerResult struct {
-	Role     string
-	Subtask  string
-	Response string
-	Tokens   int
+	Role        string
+	Subtask     string
+	Response    string
+	Tokens      int
+	Elapsed     time.Duration // time taken for the LLM call
+	ReviewScore int           // 0 = not reviewed; 1-10 reviewer quality score
+	ReviewNote  string        // brief reviewer feedback
+	Flagged     bool          // true when ReviewScore < reviewer threshold
 }
 
 // MayorOption configures a Mayor during construction.

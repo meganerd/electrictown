@@ -3,6 +3,8 @@ package role
 import (
 	"context"
 	"fmt"
+	"strconv"
+	"strings"
 
 	"github.com/meganerd/electrictown/internal/cost"
 	"github.com/meganerd/electrictown/internal/provider"
@@ -134,6 +136,51 @@ func (w *Reviewer) Validate(ctx context.Context, criteria string, output string)
 
 	w.recordCost(resp)
 	return resp, nil
+}
+
+// Score evaluates a worker's output and returns a quality score (1-10) and brief note.
+// It asks the reviewer model to respond with SCORE: N and REASON: text lines.
+// Returns score=0 on parse failure.
+func (w *Reviewer) Score(ctx context.Context, subtask, response string) (score int, note string, err error) {
+	prompt := fmt.Sprintf(
+		"You are a code quality reviewer. Score this worker output for a coding subtask.\n\n"+
+			"Subtask:\n%s\n\nOutput:\n%s\n\n"+
+			"Respond ONLY with exactly two lines:\nSCORE: N\nREASON: one-line explanation\n"+
+			"(N is 1-10; 1=completely wrong, 10=perfect)",
+		subtask, response,
+	)
+	messages := []provider.Message{
+		{Role: provider.RoleSystem, Content: "You are a concise code quality reviewer. Output only SCORE: N and REASON: text."},
+		{Role: provider.RoleUser, Content: prompt},
+	}
+	req := &provider.ChatRequest{Messages: messages}
+	resp, callErr := w.router.ChatCompletionForRole(ctx, w.role, req)
+	if callErr != nil {
+		return 0, "", callErr
+	}
+	w.recordCost(resp)
+	score, note = parseScoreResponse(resp.Message.Content)
+	return score, note, nil
+}
+
+// parseScoreResponse extracts SCORE and REASON from a reviewer response.
+func parseScoreResponse(text string) (int, string) {
+	var score int
+	var note string
+	for _, line := range strings.Split(text, "\n") {
+		line = strings.TrimSpace(line)
+		if strings.HasPrefix(line, "SCORE:") {
+			s := strings.TrimSpace(strings.TrimPrefix(line, "SCORE:"))
+			// Strip "/10" suffix if present.
+			s = strings.TrimSuffix(s, "/10")
+			if n, err := strconv.Atoi(strings.TrimSpace(s)); err == nil {
+				score = n
+			}
+		} else if strings.HasPrefix(line, "REASON:") {
+			note = strings.TrimSpace(strings.TrimPrefix(line, "REASON:"))
+		}
+	}
+	return score, note
 }
 
 // recordCost records token usage if a cost tracker is attached.

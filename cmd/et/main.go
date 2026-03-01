@@ -17,8 +17,10 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
+	"sync"
 	"time"
 
+	"github.com/meganerd/electrictown/internal/cost"
 	"github.com/meganerd/electrictown/internal/pool"
 	"github.com/meganerd/electrictown/internal/provider"
 	"github.com/meganerd/electrictown/internal/provider/anthropic"
@@ -48,6 +50,11 @@ func main() {
 			fmt.Fprintf(os.Stderr, "error: %s\n", friendlyError(err))
 			os.Exit(1)
 		}
+	case "nodes":
+		if err := cmdNodes(os.Args[2:]); err != nil {
+			fmt.Fprintf(os.Stderr, "error: %s\n", friendlyError(err))
+			os.Exit(1)
+		}
 	case "session":
 		if err := cmdSession(os.Args[2:]); err != nil {
 			fmt.Fprintf(os.Stderr, "error: %v\n", err)
@@ -71,23 +78,27 @@ Usage:
   et run [--config path] [--role name] "task description"
   et session <spawn|list|attach|kill|send> [args]
   et models [--config path]
+  et nodes  [--config path]
   et version
 
 Commands:
   run      Execute supervisor→worker flow for a task
   session  Manage interactive agent sessions in tmux
   models   List all available models from configured providers
+  nodes    Ping Ollama nodes, list models, show availability
   version  Print version information
 
 Flags (run):
   --config         Path to config file (default: ./electrictown.yaml, then $HOME/electrictown.yaml)
   --role           Supervisor role name (default: mayor; worker always uses polecat)
   --no-synthesize  Skip synthesis, print raw per-worker output (pool mode only)
-  --max-subtasks   Max subtasks for decomposition (0 = Mayor default of 5)
+  --no-reviewer    Skip Phase 2.5 reviewer scoring of worker outputs
+  --no-tester      Skip Phase 4 tester polish of synthesized output
+  --max-subtasks   Max subtasks for decomposition (0 = Mayor default of 10)
   --timeout        Total timeout in minutes for the entire run (default: 30)
   --output-dir     Directory to write output files (default: stdout only)
 
-Flags (models):
+Flags (models, nodes):
   --config   Path to config file (default: ./electrictown.yaml, then $HOME/electrictown.yaml)
 
 Run 'et session --help' for session management details.
@@ -141,7 +152,9 @@ func cmdRun(args []string) error {
 	configPath := fs.String("config", "", "path to config file (default: ./electrictown.yaml, then $HOME/electrictown.yaml)")
 	supervisorRole := fs.String("role", "mayor", "supervisor role name")
 	noSynthesize := fs.Bool("no-synthesize", false, "skip synthesis, print raw per-worker output")
-	maxSubtasks := fs.Int("max-subtasks", 0, "max subtasks (0 = use Mayor default of 5)")
+	noReviewer := fs.Bool("no-reviewer", false, "skip Phase 2.5 reviewer scoring of worker outputs")
+	noTester := fs.Bool("no-tester", false, "skip Phase 4 tester polish of synthesized output")
+	maxSubtasks := fs.Int("max-subtasks", 0, "max subtasks (0 = use Mayor default of 10)")
 	timeoutMins := fs.Int("timeout", 30, "total timeout in minutes for the entire run")
 	outputDir := fs.String("output-dir", "", "directory to write output files (default: stdout only)")
 	if err := fs.Parse(args); err != nil {
@@ -195,54 +208,96 @@ func cmdRun(args []string) error {
 	// Check if the worker role has a pool configured.
 	poolAliases := cfg.PoolForRole(workerRole)
 	if len(poolAliases) > 0 {
-		return cmdRunParallel(ctx, router, cfg, task, *supervisorRole, poolAliases, *noSynthesize, *maxSubtasks, *outputDir, runLogDir)
+		return cmdRunParallel(ctx, router, cfg, task, *supervisorRole, poolAliases, *noSynthesize, *noReviewer, *noTester, *maxSubtasks, *outputDir, runLogDir)
 	}
 
 	// Legacy single-worker flow (no pool configured).
 	return cmdRunSingle(ctx, router, task, *supervisorRole, workerRole, *outputDir, runLogDir)
 }
 
-// cmdRunParallel implements the three-phase pipeline: decompose → parallel execute → synthesize.
-func cmdRunParallel(ctx context.Context, router *provider.Router, cfg *provider.Config, task, supervisorRole string, poolAliases []string, noSynthesize bool, maxSubtasks int, outputDir, runLogDir string) error {
+// cmdRunParallel implements the multi-phase pipeline:
+//  1. Decompose  2. Parallel workers  2.5. Reviewer (optional)  3. Synthesize  4. Tester (optional)
+func cmdRunParallel(ctx context.Context, router *provider.Router, cfg *provider.Config, task, supervisorRole string, poolAliases []string, noSynthesize, noReviewer, noTester bool, maxSubtasks int, outputDir, runLogDir string) error {
+	// Shared cost tracker for all roles in this run.
+	tracker := cost.NewTracker(cost.DefaultPricing())
+
 	// Build Mayor with options.
 	var mayorOpts []role.MayorOption
 	mayorOpts = append(mayorOpts, role.WithMayorRole(supervisorRole))
+	mayorOpts = append(mayorOpts, role.WithMayorCostTracker(tracker))
 	if maxSubtasks > 0 {
 		mayorOpts = append(mayorOpts, role.WithMayorMaxSubtasks(maxSubtasks))
 	}
 	mayor := role.NewMayor(router, mayorOpts...)
 
-	// Phase 1: Decompose.
+	// Phase 1: Decompose (with spinner showing live token count).
 	fmt.Printf("Phase 1: Supervisor (%s) decomposing task...\n", supervisorRole)
+	stopSpin1 := startSpinner(spinLabelWithToks("  decomposing", tracker))
 	subtasks, err := mayor.Decompose(ctx, task)
+	stopSpin1()
 	if err != nil {
 		return fmt.Errorf("supervisor decompose failed: %w", err)
 	}
-	fmt.Printf("  Subtasks: %d\n\n", len(subtasks))
+	fmt.Printf("  Subtasks: %d\n", len(subtasks))
 	for i, st := range subtasks {
 		fmt.Printf("  [%d] %s\n", i+1, truncate(st, 100))
 	}
 	fmt.Println()
 
-	// Phase 2: Parallel worker execution.
-	fmt.Printf("Phase 2: Workers executing in parallel (%d subtasks, %d pool members)...\n", len(subtasks), len(poolAliases))
+	// Phase 2: Parallel worker execution with live progress.
+	n := len(subtasks)
+	fmt.Printf("Phase 2: Workers executing in parallel (%d subtasks, %d pool members)...\n", n, len(poolAliases))
 
 	balancer := provider.NewBalancer(provider.StrategyRoundRobin)
 	wp := pool.New(router, balancer, poolAliases)
 	workerSystemPrompt := workerPrompt(outputDir)
 
-	start := time.Now()
-	results := wp.ExecuteAll(ctx, subtasks, workerSystemPrompt)
-	elapsed := time.Since(start)
-
-	for i, r := range results {
+	lp := newLiveProgress(n)
+	wp.SetProgressHook(func(idx int, r role.WorkerResult) {
 		status := "✓"
 		if strings.HasPrefix(r.Response, "error:") {
 			status = "✗"
 		}
-		fmt.Printf("  [%d/%d] %-16s %s (%d tokens, %.1fs)\n", i+1, len(results), r.Role, status, r.Tokens, elapsed.Seconds())
-	}
+		toks := fmt.Sprintf("%d tok", r.Tokens)
+		tps := ""
+		if r.Elapsed > 0 && r.Tokens > 0 {
+			tps = fmt.Sprintf(", %.0f tok/s", float64(r.Tokens)/r.Elapsed.Seconds())
+		}
+		lp.update(idx, fmt.Sprintf("  [%d/%d] %-18s %s (%s%s, %.1fs)",
+			idx+1, n, truncate(r.Role, 18), status, toks, tps, r.Elapsed.Seconds()))
+	})
+
+	results := wp.ExecuteAll(ctx, subtasks, workerSystemPrompt)
 	fmt.Println()
+
+	// Phase 2.5: Reviewer (optional — skipped if --no-reviewer or role not configured).
+	if !noReviewer {
+		if _, ok := cfg.Roles["reviewer"]; ok {
+			fmt.Printf("Phase 2.5: Reviewer scoring worker outputs...\n")
+			reviewer := role.NewReviewer(router, role.WithWitnessCostTracker(tracker))
+			for i := range results {
+				if strings.HasPrefix(results[i].Response, "error:") {
+					continue
+				}
+				score, note, err := reviewer.Score(ctx, results[i].Subtask, results[i].Response)
+				if err != nil {
+					fmt.Fprintf(os.Stderr, "  reviewer[%d]: %v\n", i+1, err)
+					continue
+				}
+				results[i].ReviewScore = score
+				results[i].ReviewNote = note
+				results[i].Flagged = score > 0 && score < 6
+				flag := "✓"
+				if results[i].Flagged {
+					flag = "⚑"
+				}
+				fmt.Printf("  [%d/%d] score=%d/10 %s %s\n", i+1, len(results), score, flag, truncate(note, 80))
+			}
+			fmt.Println()
+		} else {
+			fmt.Fprintf(os.Stderr, "  note: reviewer role not configured — skipping Phase 2.5\n")
+		}
+	}
 
 	// Phase 3: Synthesize (unless --no-synthesize).
 	if noSynthesize {
@@ -256,9 +311,31 @@ func cmdRunParallel(ctx context.Context, router *provider.Router, cfg *provider.
 	}
 
 	fmt.Printf("Phase 3: Supervisor synthesizing results...\n")
+	stopSpin3 := startSpinner(spinLabelWithToks("  synthesizing", tracker))
 	synthesis, err := mayor.Synthesize(ctx, task, results)
+	stopSpin3()
 	if err != nil {
 		return fmt.Errorf("supervisor synthesize failed: %w", err)
+	}
+
+	// Phase 4: Tester polish (optional — skipped if --no-tester or role not configured).
+	if !noTester {
+		if _, ok := cfg.Roles["tester"]; ok {
+			fmt.Printf("Phase 4: Tester polishing synthesized output...\n")
+			stopSpin4 := startSpinner(spinLabelWithToks("  refining", tracker))
+			tester := role.NewTester(router, role.WithRefineryCostTracker(tracker))
+			refined, err := tester.Refine(ctx, synthesis)
+			stopSpin4()
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "  tester failed: %v — using raw synthesis\n", err)
+			} else {
+				synthesis = refined.Message.Content
+				fmt.Printf("  Tester refined output (%d tokens)\n", refined.Usage.TotalTokens)
+			}
+			fmt.Println()
+		} else {
+			fmt.Fprintf(os.Stderr, "  note: tester role not configured — skipping Phase 4\n")
+		}
 	}
 
 	fmt.Printf("\n--- Final Output ---\n")
@@ -274,6 +351,19 @@ func cmdRunParallel(ctx context.Context, router *provider.Router, cfg *provider.
 		fmt.Fprintf(os.Stderr, "  warning: could not write _synthesis.md: %v\n", err)
 	} else {
 		fmt.Printf("  → logged %s\n", filepath.Join(runLogDir, "_synthesis.md"))
+	}
+
+	// Token summary by role.
+	sum := tracker.Summary()
+	if sum.TotalTokens > 0 {
+		fmt.Printf("\n--- Token Usage ---\n")
+		for _, roleName := range []string{"mayor", "reviewer", "tester"} {
+			if rs, ok := sum.ByRole[roleName]; ok {
+				fmt.Printf("  %-12s %s tok\n", roleName+":", formatToks(rs.Tokens))
+			}
+		}
+		fmt.Printf("  %-12s %s tok\n", "total:", formatToks(sum.TotalTokens))
+		fmt.Printf("-------------------\n")
 	}
 
 	return nil
@@ -557,6 +647,92 @@ func writeOutputFile(dir, filename, content string) error {
 		return fmt.Errorf("create directories for %s: %w", fullPath, err)
 	}
 	return os.WriteFile(fullPath, []byte(content), 0644)
+}
+
+// startSpinner launches an animated spinner on stderr. labelFn is called on
+// each tick to get the current label (allowing live cost/token updates).
+// Returns a stop function that stops the spinner and clears the line.
+func startSpinner(labelFn func() string) func() {
+	frames := []string{"⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"}
+	stop := make(chan struct{})
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		i := 0
+		for {
+			select {
+			case <-stop:
+				fmt.Fprintf(os.Stderr, "\r\033[K")
+				return
+			case <-time.After(80 * time.Millisecond):
+				fmt.Fprintf(os.Stderr, "\r%s %s ", frames[i%len(frames)], labelFn())
+				i++
+			}
+		}
+	}()
+	return func() {
+		close(stop)
+		wg.Wait()
+	}
+}
+
+// spinLabel returns a static label function for startSpinner.
+func spinLabel(s string) func() string { return func() string { return s } }
+
+// spinLabelWithToks returns a label function that appends a live token count.
+func spinLabelWithToks(base string, tracker *cost.Tracker) func() string {
+	return func() string {
+		total := tracker.Summary().TotalTokens
+		if total == 0 {
+			return base
+		}
+		return fmt.Sprintf("%s [%s tok]", base, formatToks(total))
+	}
+}
+
+// formatToks formats a token count as "1.2k" or "123".
+func formatToks(n int) string {
+	if n >= 1000 {
+		return fmt.Sprintf("%.1fk", float64(n)/1000)
+	}
+	return fmt.Sprintf("%d", n)
+}
+
+// liveProgress renders per-worker status lines in-place using ANSI cursor moves.
+type liveProgress struct {
+	mu      sync.Mutex
+	lines   []string
+	started bool
+}
+
+func newLiveProgress(n int) *liveProgress {
+	lines := make([]string, n)
+	for i := range lines {
+		lines[i] = fmt.Sprintf("  [%d/%d] waiting...", i+1, n)
+	}
+	return &liveProgress{lines: lines}
+}
+
+func (lp *liveProgress) update(idx int, line string) {
+	lp.mu.Lock()
+	defer lp.mu.Unlock()
+	if idx >= 0 && idx < len(lp.lines) {
+		lp.lines[idx] = line
+	}
+	n := len(lp.lines)
+	if !lp.started {
+		for _, l := range lp.lines {
+			fmt.Println(l)
+		}
+		lp.started = true
+		return
+	}
+	// Cursor up n lines, then reprint each.
+	fmt.Printf("\033[%dA", n)
+	for _, l := range lp.lines {
+		fmt.Printf("\r\033[K%s\n", l)
+	}
 }
 
 // writeWorkerFiles writes parsed file outputs from a single worker.
