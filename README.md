@@ -10,6 +10,8 @@ Provider-agnostic multi-agent coding orchestrator in Go.
 
 Electrictown is a multi-agent coding orchestrator that decouples agent role assignment from any specific LLM provider. It defines a unified `Provider` interface and routes requests through a configuration-driven router, so any model from any provider can fill any agent role -- supervisor, worker, reviewer, or polisher.
 
+__**The goal is to become independant from any specific LLM provider and their tools.  Eventually we want this to be a stand alone tool, similar to Claude Code, Aider, Codex, and so on.  Right now we still rely on those tools for planning and looping/iterating on generated code.  See the documentation for more details.**__
+
 The problem it solves is tight coupling between agent orchestration logic and LLM vendor APIs. When your supervisor is hardwired to Claude and your workers are hardwired to GPT, switching providers means rewriting orchestration code. Electrictown eliminates that coupling: providers are adapters behind a common interface, models are aliases in a YAML config, and roles map to aliases with automatic fallback chains.
 
 The result is a system where you can run a Claude supervisor with Ollama local workers and a Gemini reviewer, swap any of them by editing one line of YAML, and get automatic failover to fallback models on rate limits or server errors -- all while tracking per-request costs by role, provider, and model.

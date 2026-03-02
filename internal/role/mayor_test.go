@@ -256,6 +256,109 @@ func TestPlan_ReturnsSummaryAndSubtasks(t *testing.T) {
 	}
 }
 
+// --- Assess tests ---
+
+func TestAssess_ParsesURLsFromJSON(t *testing.T) {
+	mock := &mockProvider{
+		name: "test",
+		response: &provider.ChatResponse{
+			ID:    "resp-assess-1",
+			Model: "mock-v1",
+			Message: provider.Message{
+				Role:    provider.RoleAssistant,
+				Content: `{"staleness_risk": "high", "fetch_urls": ["https://docs.postalserver.io/install/docker"]}`,
+			},
+			Usage: provider.Usage{PromptTokens: 100, CompletionTokens: 40, TotalTokens: 140},
+			Done:  true,
+		},
+	}
+	router := buildTestRouter(t, "mayor", mock)
+	m := NewMayor(router)
+
+	result, err := m.Assess(context.Background(), "Install postal mail server")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if result.StalenessRisk != "high" {
+		t.Errorf("expected staleness_risk 'high', got %q", result.StalenessRisk)
+	}
+	if len(result.FetchURLs) != 1 || result.FetchURLs[0] != "https://docs.postalserver.io/install/docker" {
+		t.Errorf("unexpected FetchURLs: %v", result.FetchURLs)
+	}
+}
+
+func TestAssess_RecordsCostWhenTrackerProvided(t *testing.T) {
+	mock := &mockProvider{
+		name: "test",
+		response: &provider.ChatResponse{
+			ID:    "resp-assess-2",
+			Model: "mock-v1",
+			Message: provider.Message{
+				Role:    provider.RoleAssistant,
+				Content: `{"staleness_risk": "low", "fetch_urls": []}`,
+			},
+			Usage: provider.Usage{PromptTokens: 80, CompletionTokens: 20, TotalTokens: 100},
+			Done:  true,
+		},
+	}
+	router := buildTestRouter(t, "mayor", mock)
+	tracker := cost.NewTracker(nil)
+	m := NewMayor(router, WithMayorCostTracker(tracker))
+
+	_, err := m.Assess(context.Background(), "Refactor this function")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	records := tracker.Records()
+	if len(records) != 1 {
+		t.Fatalf("expected 1 cost record, got %d", len(records))
+	}
+	if records[0].TotalTokens != 100 {
+		t.Errorf("expected 100 total tokens, got %d", records[0].TotalTokens)
+	}
+}
+
+// --- ParseAssessResult tests ---
+
+func TestParseAssessResult_ValidJSON(t *testing.T) {
+	input := `{"staleness_risk": "high", "fetch_urls": ["https://docs.example.com/page"]}`
+	result := ParseAssessResult(input)
+	if result.StalenessRisk != "high" {
+		t.Errorf("expected 'high', got %q", result.StalenessRisk)
+	}
+	if len(result.FetchURLs) != 1 || result.FetchURLs[0] != "https://docs.example.com/page" {
+		t.Errorf("unexpected FetchURLs: %v", result.FetchURLs)
+	}
+}
+
+func TestParseAssessResult_ProseWrappedJSON(t *testing.T) {
+	input := "Sure! Here is my assessment:\n\n{\"staleness_risk\": \"medium\", \"fetch_urls\": []}\n\nHope that helps."
+	result := ParseAssessResult(input)
+	if result.StalenessRisk != "medium" {
+		t.Errorf("expected 'medium', got %q", result.StalenessRisk)
+	}
+	if len(result.FetchURLs) != 0 {
+		t.Errorf("expected empty FetchURLs, got %v", result.FetchURLs)
+	}
+}
+
+func TestParseAssessResult_MarkdownFenceWrapped(t *testing.T) {
+	input := "```json\n{\"staleness_risk\": \"low\", \"fetch_urls\": []}\n```"
+	result := ParseAssessResult(input)
+	if result.StalenessRisk != "low" {
+		t.Errorf("expected 'low', got %q", result.StalenessRisk)
+	}
+}
+
+func TestParseAssessResult_MalformedInput(t *testing.T) {
+	for _, bad := range []string{"", "   ", "not json at all", "{bad json}"} {
+		result := ParseAssessResult(bad)
+		if result == nil {
+			t.Errorf("ParseAssessResult(%q): expected non-nil result", bad)
+		}
+	}
+}
+
 // --- ParseSubtasks tests ---
 
 func TestParseSubtasks_NumberedList(t *testing.T) {

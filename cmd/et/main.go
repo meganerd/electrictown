@@ -22,6 +22,7 @@ import (
 
 	"github.com/meganerd/electrictown/internal/build"
 	"github.com/meganerd/electrictown/internal/cost"
+	"github.com/meganerd/electrictown/internal/jina"
 	"github.com/meganerd/electrictown/internal/pool"
 	"github.com/meganerd/electrictown/internal/provider"
 	"github.com/meganerd/electrictown/internal/provider/anthropic"
@@ -111,6 +112,7 @@ Flags (run):
   --rag-url         Qdrant server URL for RAG context injection (empty = disabled)
   --rag-collection  Qdrant collection name (default: et-knowledge)
   --rag-embed-url   Ollama URL for RAG embeddings (default: http://ai01:11434)
+  --jina-key        Jina AI Reader API key for mayor-driven URL fetch (falls back to JINA_API_KEY env var)
 
 Flags (models, nodes):
   --config   Path to config file (default: ./electrictown.yaml, then $HOME/electrictown.yaml)
@@ -177,6 +179,7 @@ func cmdRun(args []string) error {
 	ragURL := fs.String("rag-url", "", "Qdrant server URL for RAG context injection (empty = disabled)")
 	ragCollection := fs.String("rag-collection", "et-knowledge", "Qdrant collection name for RAG")
 	ragEmbedURL := fs.String("rag-embed-url", "http://ai01:11434", "Ollama URL for RAG embeddings")
+	jinaKey := fs.String("jina-key", "", "Jina AI Reader API key for mayor-driven URL fetch (falls back to JINA_API_KEY env var)")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -228,7 +231,7 @@ func cmdRun(args []string) error {
 	// Check if the worker role has a pool configured.
 	poolAliases := cfg.PoolForRole(workerRole)
 	if len(poolAliases) > 0 {
-		return cmdRunParallel(ctx, router, cfg, task, *supervisorRole, poolAliases, *noSynthesize, *noReviewer, *noTester, *iterate, *maxIterations, *maxSubtasks, *outputDir, runLogDir, *ragURL, *ragCollection, *ragEmbedURL)
+		return cmdRunParallel(ctx, router, cfg, task, *supervisorRole, poolAliases, *noSynthesize, *noReviewer, *noTester, *iterate, *maxIterations, *maxSubtasks, *outputDir, runLogDir, *ragURL, *ragCollection, *ragEmbedURL, *jinaKey)
 	}
 
 	// Legacy single-worker flow (no pool configured).
@@ -237,9 +240,10 @@ func cmdRun(args []string) error {
 
 // cmdRunParallel implements the multi-phase pipeline:
 //
-//	0. RAG (optional)  1. Decompose  2. Parallel workers  2.5. Reviewer (optional)
-//	3. Synthesize  4. Tester (optional)  5. Build/fix loop (optional, requires --iterate)
-func cmdRunParallel(ctx context.Context, router *provider.Router, cfg *provider.Config, task, supervisorRole string, poolAliases []string, noSynthesize, noReviewer, noTester, iterate bool, maxIterations, maxSubtasks int, outputDir, runLogDir, ragURL, ragCollection, ragEmbedURL string) error {
+//	0. RAG (optional)  0.5. Jina fetch (optional)  1. Decompose  2. Parallel workers
+//	2.5. Reviewer (optional)  3. Synthesize  4. Tester (optional)
+//	5. Build/fix loop (optional, requires --iterate)
+func cmdRunParallel(ctx context.Context, router *provider.Router, cfg *provider.Config, task, supervisorRole string, poolAliases []string, noSynthesize, noReviewer, noTester, iterate bool, maxIterations, maxSubtasks int, outputDir, runLogDir, ragURL, ragCollection, ragEmbedURL, jinaKey string) error {
 	// Shared cost tracker for all roles in this run.
 	tracker := cost.NewTracker(cost.DefaultPricing())
 
@@ -275,6 +279,47 @@ func cmdRunParallel(ctx context.Context, router *provider.Router, cfg *provider.
 	decomposeTask := task
 	if ragContext != "" {
 		decomposeTask = ragContext + "\n---\n\n" + task
+	}
+
+	// Phase 0.5: Mayor staleness assessment + Jina Reader URL fetch (optional).
+	// Runs when --jina-key is set (or JINA_API_KEY env var). Skipped when no key.
+	resolvedJinaKey := jinaKey
+	if resolvedJinaKey == "" {
+		resolvedJinaKey = os.Getenv("JINA_API_KEY")
+	}
+	if resolvedJinaKey != "" {
+		fmt.Printf("Phase 0.5: Mayor assessing knowledge staleness...\n")
+		stopSpin05 := startSpinner(spinLabelWithToks("  assessing", tracker))
+		assess, assessErr := mayor.Assess(ctx, task)
+		stopSpin05()
+		if assessErr != nil {
+			fmt.Fprintf(os.Stderr, "  warning: mayor assess failed: %v — continuing without Jina fetch\n", assessErr)
+		} else {
+			fmt.Printf("  Staleness risk: %s\n", assess.StalenessRisk)
+			if len(assess.FetchURLs) > 0 {
+				fmt.Printf("  Fetching %d URL(s) via Jina Reader...\n", len(assess.FetchURLs))
+				jinaClient := jina.New(resolvedJinaKey)
+				var jinaBuilder strings.Builder
+				for _, u := range assess.FetchURLs {
+					content, fetchErr := jinaClient.FetchURL(ctx, u)
+					if fetchErr != nil {
+						fmt.Fprintf(os.Stderr, "  warning: Jina fetch %s: %v\n", u, fetchErr)
+						continue
+					}
+					if len(content) > 8192 {
+						content = content[:8192]
+					}
+					jinaBuilder.WriteString(fmt.Sprintf("=== Fetched: %s ===\n%s\n\n", u, content))
+					fmt.Printf("  ✓ fetched %s (%d chars)\n", u, len(content))
+				}
+				if jinaBuilder.Len() > 0 {
+					fetched := jinaBuilder.String()
+					decomposeTask = fetched + "\n---\n\n" + decomposeTask
+					workerRAGContext = fetched + "\n\n" + workerRAGContext
+				}
+			}
+		}
+		fmt.Println()
 	}
 
 	// Phase 1: Decompose (with spinner showing live token count).

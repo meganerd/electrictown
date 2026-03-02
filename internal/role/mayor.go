@@ -2,6 +2,7 @@ package role
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"regexp"
 	"strings"
@@ -206,6 +207,79 @@ func ParseSubtasks(text string) []string {
 		}
 	}
 	return subtasks
+}
+
+// AssessResult holds the output of Mayor.Assess.
+type AssessResult struct {
+	FetchURLs     []string
+	StalenessRisk string // "high", "medium", or "low"
+}
+
+const assessSystemPrompt = `You are a technical knowledge assessor. Evaluate whether local AI workers would have accurate, up-to-date knowledge to complete the given task.
+
+Local workers have training data with an approximate cutoff of 2024-01. Respond with ONLY valid JSON — no prose, no markdown fences, no explanation:
+
+{"staleness_risk": "high|medium|low", "fetch_urls": ["url1", "url2"]}
+
+Rules:
+- staleness_risk: "high" if the task involves software, APIs, or practices released or significantly changed after 2024-01; "medium" if possibly outdated; "low" if stable or timeless
+- fetch_urls: list 0-3 specific official documentation URLs workers need for accurate output. Only include URLs you are highly confident currently exist and are relevant. Use empty array if not needed.
+- Prefer official documentation (docs.example.com, pkg.go.dev, github.com/*/README, etc.)`
+
+// Assess evaluates a task for training-data staleness and returns URLs to fetch.
+// If the mayor cannot identify relevant URLs or the risk is low, FetchURLs will be empty.
+// A failed assess call is non-fatal — callers should warn and continue.
+func (m *Mayor) Assess(ctx context.Context, task string) (*AssessResult, error) {
+	userMsg := fmt.Sprintf(
+		"Today's date is %s.\n\nTask: %s\n\nRespond with ONLY valid JSON:\n{\"staleness_risk\": \"high|medium|low\", \"fetch_urls\": [\"url1\"]}",
+		time.Now().Format("2006-01-02"), task,
+	)
+	req := &provider.ChatRequest{
+		Messages: []provider.Message{
+			{Role: provider.RoleSystem, Content: assessSystemPrompt},
+			{Role: provider.RoleUser, Content: userMsg},
+		},
+	}
+
+	resp, err := m.router.ChatCompletionForRole(ctx, m.role, req)
+	if err != nil {
+		return nil, err
+	}
+
+	m.recordCost(resp)
+
+	return ParseAssessResult(resp.Message.Content), nil
+}
+
+// ParseAssessResult extracts an AssessResult from a model response.
+// It handles prose-wrapped JSON and markdown code fences.
+// On malformed or absent JSON it returns an empty AssessResult (not an error).
+func ParseAssessResult(text string) *AssessResult {
+	// Strip common markdown code fences.
+	text = strings.TrimSpace(text)
+	text = strings.TrimPrefix(text, "```json")
+	text = strings.TrimPrefix(text, "```")
+	text = strings.TrimSuffix(text, "```")
+	text = strings.TrimSpace(text)
+
+	// Find the JSON object between the first { and last }.
+	start := strings.Index(text, "{")
+	end := strings.LastIndex(text, "}")
+	if start < 0 || end <= start {
+		return &AssessResult{}
+	}
+
+	var raw struct {
+		StalenessRisk string   `json:"staleness_risk"`
+		FetchURLs     []string `json:"fetch_urls"`
+	}
+	if err := json.Unmarshal([]byte(text[start:end+1]), &raw); err != nil {
+		return &AssessResult{}
+	}
+	return &AssessResult{
+		FetchURLs:     raw.FetchURLs,
+		StalenessRisk: raw.StalenessRisk,
+	}
 }
 
 // recordCost records token usage with the cost tracker if one is configured.
