@@ -28,6 +28,7 @@ import (
 	"github.com/meganerd/electrictown/internal/provider/gemini"
 	"github.com/meganerd/electrictown/internal/provider/ollama"
 	"github.com/meganerd/electrictown/internal/provider/openai"
+	"github.com/meganerd/electrictown/internal/rag"
 	"github.com/meganerd/electrictown/internal/role"
 )
 
@@ -56,6 +57,11 @@ func main() {
 			fmt.Fprintf(os.Stderr, "error: %s\n", friendlyError(err))
 			os.Exit(1)
 		}
+	case "rag":
+		if err := cmdRag(os.Args[2:]); err != nil {
+			fmt.Fprintf(os.Stderr, "error: %s\n", err)
+			os.Exit(1)
+		}
 	case "session":
 		if err := cmdSession(os.Args[2:]); err != nil {
 			fmt.Fprintf(os.Stderr, "error: %v\n", err)
@@ -78,13 +84,15 @@ func printUsage() {
 Usage:
   et run [--config path] [--role name] "task description"
   et session <spawn|list|attach|kill|send> [args]
-  et models [--config path]
-  et nodes  [--config path]
+  et rag     <ingest|query|stats> [flags] [args]
+  et models  [--config path]
+  et nodes   [--config path]
   et version
 
 Commands:
   run      Execute supervisor→worker flow for a task
   session  Manage interactive agent sessions in tmux
+  rag      Manage RAG knowledge base (ingest, query, stats)
   models   List all available models from configured providers
   nodes    Ping Ollama nodes, list models, show availability
   version  Print version information
@@ -100,11 +108,15 @@ Flags (run):
   --max-subtasks    Max subtasks for decomposition (0 = Mayor default of 10)
   --timeout         Total timeout in minutes for the entire run (default: 30)
   --output-dir      Directory to write output files (default: stdout only)
+  --rag-url         Qdrant server URL for RAG context injection (empty = disabled)
+  --rag-collection  Qdrant collection name (default: et-knowledge)
+  --rag-embed-url   Ollama URL for RAG embeddings (default: http://ai01:11434)
 
 Flags (models, nodes):
   --config   Path to config file (default: ./electrictown.yaml, then $HOME/electrictown.yaml)
 
 Run 'et session --help' for session management details.
+Run 'et rag ingest --help', 'et rag query --help', or 'et rag stats --help' for RAG details.
 `)
 }
 
@@ -162,6 +174,9 @@ func cmdRun(args []string) error {
 	maxSubtasks := fs.Int("max-subtasks", 0, "max subtasks (0 = use Mayor default of 10)")
 	timeoutMins := fs.Int("timeout", 30, "total timeout in minutes for the entire run")
 	outputDir := fs.String("output-dir", "", "directory to write output files (default: stdout only)")
+	ragURL := fs.String("rag-url", "", "Qdrant server URL for RAG context injection (empty = disabled)")
+	ragCollection := fs.String("rag-collection", "et-knowledge", "Qdrant collection name for RAG")
+	ragEmbedURL := fs.String("rag-embed-url", "http://ai01:11434", "Ollama URL for RAG embeddings")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -213,7 +228,7 @@ func cmdRun(args []string) error {
 	// Check if the worker role has a pool configured.
 	poolAliases := cfg.PoolForRole(workerRole)
 	if len(poolAliases) > 0 {
-		return cmdRunParallel(ctx, router, cfg, task, *supervisorRole, poolAliases, *noSynthesize, *noReviewer, *noTester, *iterate, *maxIterations, *maxSubtasks, *outputDir, runLogDir)
+		return cmdRunParallel(ctx, router, cfg, task, *supervisorRole, poolAliases, *noSynthesize, *noReviewer, *noTester, *iterate, *maxIterations, *maxSubtasks, *outputDir, runLogDir, *ragURL, *ragCollection, *ragEmbedURL)
 	}
 
 	// Legacy single-worker flow (no pool configured).
@@ -222,9 +237,9 @@ func cmdRun(args []string) error {
 
 // cmdRunParallel implements the multi-phase pipeline:
 //
-//	1. Decompose  2. Parallel workers  2.5. Reviewer (optional)  3. Synthesize
-//	4. Tester (optional)  5. Build/fix loop (optional, requires --iterate)
-func cmdRunParallel(ctx context.Context, router *provider.Router, cfg *provider.Config, task, supervisorRole string, poolAliases []string, noSynthesize, noReviewer, noTester, iterate bool, maxIterations, maxSubtasks int, outputDir, runLogDir string) error {
+//	0. RAG (optional)  1. Decompose  2. Parallel workers  2.5. Reviewer (optional)
+//	3. Synthesize  4. Tester (optional)  5. Build/fix loop (optional, requires --iterate)
+func cmdRunParallel(ctx context.Context, router *provider.Router, cfg *provider.Config, task, supervisorRole string, poolAliases []string, noSynthesize, noReviewer, noTester, iterate bool, maxIterations, maxSubtasks int, outputDir, runLogDir, ragURL, ragCollection, ragEmbedURL string) error {
 	// Shared cost tracker for all roles in this run.
 	tracker := cost.NewTracker(cost.DefaultPricing())
 
@@ -237,10 +252,35 @@ func cmdRunParallel(ctx context.Context, router *provider.Router, cfg *provider.
 	}
 	mayor := role.NewMayor(router, mayorOpts...)
 
+	// Phase 0: RAG context retrieval (optional — only when --rag-url is set).
+	ragContext := ""
+	workerRAGContext := ""
+	if ragURL != "" {
+		fmt.Printf("Phase 0: RAG context retrieval from %s (collection: %s)...\n", ragURL, ragCollection)
+		ragClient := rag.NewClient(ragURL, ragCollection)
+		ragEmbedder := rag.NewEmbedder(ragEmbedURL, rag.DefaultEmbedModel)
+		retriever := rag.NewRetriever(ragClient, ragEmbedder)
+		results, err := retriever.Retrieve(ctx, task, 3)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "  warning: RAG retrieval failed: %v — continuing without context\n", err)
+		} else {
+			ragContext = retriever.FormatContext(results)
+			workerRAGContext = ragContext
+			fmt.Printf("  Retrieved %d chunks\n", len(results))
+		}
+		fmt.Println()
+	}
+
+	// Augment the task with RAG context for the mayor decompose call.
+	decomposeTask := task
+	if ragContext != "" {
+		decomposeTask = ragContext + "\n---\n\n" + task
+	}
+
 	// Phase 1: Decompose (with spinner showing live token count).
 	fmt.Printf("Phase 1: Supervisor (%s) decomposing task...\n", supervisorRole)
 	stopSpin1 := startSpinner(spinLabelWithToks("  decomposing", tracker))
-	subtasks, err := mayor.Decompose(ctx, task)
+	subtasks, err := mayor.Decompose(ctx, decomposeTask)
 	stopSpin1()
 	if err != nil {
 		return fmt.Errorf("supervisor decompose failed: %w", err)
@@ -258,6 +298,10 @@ func cmdRunParallel(ctx context.Context, router *provider.Router, cfg *provider.
 	balancer := provider.NewBalancer(provider.StrategyRoundRobin)
 	wp := pool.New(router, balancer, poolAliases)
 	workerSystemPrompt := workerPrompt(outputDir)
+	// Prepend RAG context to worker system prompt if available.
+	if workerRAGContext != "" {
+		workerSystemPrompt = workerRAGContext + "\n---\n\n" + workerSystemPrompt
+	}
 
 	lp := newLiveProgress(n)
 	wp.SetProgressHook(func(idx int, r role.WorkerResult) {
