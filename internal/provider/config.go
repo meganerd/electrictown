@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 
 	"gopkg.in/yaml.v3"
@@ -22,6 +23,10 @@ type Config struct {
 
 	// Defaults sets fallback values when not specified per-role.
 	Defaults DefaultsConfig `yaml:"defaults"`
+
+	// Specialists defines domain-specific workers with dedicated models.
+	// The mayor assigns subtasks to specialists based on their descriptions.
+	Specialists map[string]SpecialistConfig `yaml:"specialists,omitempty"`
 }
 
 // AuthType constants for provider authentication methods.
@@ -60,6 +65,15 @@ type DefaultsConfig struct {
 	MaxTokens   int      `yaml:"max_tokens,omitempty"`   // default max tokens
 	Temperature float64  `yaml:"temperature,omitempty"`  // default temperature
 	LogDir      string   `yaml:"log_dir,omitempty"`      // directory for run logs (default: ~/Documents)
+}
+
+// SpecialistConfig defines a domain-specific worker that uses a particular model.
+// The mayor assigns subtasks to specialists based on their description.
+type SpecialistConfig struct {
+	Model       string   `yaml:"model"`                // primary model alias
+	Description string   `yaml:"description,omitempty"` // description for mayor context
+	Pool        []string `yaml:"pool,omitempty"`        // parallel pool model aliases
+	Fallbacks   []string `yaml:"fallbacks,omitempty"`   // fallback chain
 }
 
 // LoadConfig reads and parses an electrictown YAML config file.
@@ -159,6 +173,26 @@ func (c *Config) Validate() error {
 			return fmt.Errorf("config: provider %q auth_type is %q but no api_key is set", name, pc.AuthType)
 		}
 	}
+	// Validate specialist references.
+	builtinRoles := map[string]bool{"mayor": true, "polecat": true, "reviewer": true, "tester": true}
+	for name, sc := range c.Specialists {
+		if builtinRoles[name] {
+			return fmt.Errorf("config: specialist %q conflicts with built-in role name", name)
+		}
+		if _, ok := c.Models[sc.Model]; !ok {
+			return fmt.Errorf("config: specialist %q references unknown model alias %q", name, sc.Model)
+		}
+		for _, pa := range sc.Pool {
+			if _, ok := c.Models[pa]; !ok {
+				return fmt.Errorf("config: specialist %q pool references unknown model alias %q", name, pa)
+			}
+		}
+		for _, fb := range sc.Fallbacks {
+			if _, ok := c.Models[fb]; !ok {
+				return fmt.Errorf("config: specialist %q fallback references unknown model alias %q", name, fb)
+			}
+		}
+	}
 	// Detect pointless fallbacks (same provider+model as primary).
 	for role, rc := range c.Roles {
 		primary, ok := c.Models[rc.Model]
@@ -239,4 +273,17 @@ func (c *Config) PoolForRole(role string) []string {
 		return rc.Pool
 	}
 	return nil
+}
+
+// SpecialistNames returns a sorted list of configured specialist names.
+func (c *Config) SpecialistNames() []string {
+	if len(c.Specialists) == 0 {
+		return nil
+	}
+	names := make([]string, 0, len(c.Specialists))
+	for name := range c.Specialists {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	return names
 }

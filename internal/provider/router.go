@@ -114,6 +114,41 @@ func (r *Router) ListAllModels(ctx context.Context) ([]Model, error) {
 	return all, nil
 }
 
+// ChatCompletionWithFallbacks routes a request by model alias, trying the given
+// fallback aliases in order if the primary fails with a retryable error.
+func (r *Router) ChatCompletionWithFallbacks(ctx context.Context, req *ChatRequest, fallbacks []string) (*ChatResponse, error) {
+	resp, err := r.ChatCompletion(ctx, req)
+	if err == nil || len(fallbacks) == 0 {
+		return resp, err
+	}
+
+	errCode := ClassifyError(err)
+	switch errCode {
+	case ErrRateLimit, ErrContextWindow, ErrServerError, ErrTimeout:
+		// Worth retrying with a different model.
+	default:
+		return nil, err
+	}
+
+	primaryErr := err
+	for _, fb := range fallbacks {
+		pc, model, resolveErr := r.config.ResolveModel(fb)
+		if resolveErr != nil {
+			continue
+		}
+		p, pErr := r.providerFor(pc)
+		if pErr != nil {
+			continue
+		}
+		req.Model = model
+		resp, err = p.ChatCompletion(ctx, req)
+		if err == nil {
+			return resp, nil
+		}
+	}
+	return nil, fmt.Errorf("router: all fallbacks exhausted for model (primary error: %w)", primaryErr)
+}
+
 // resolve maps a model reference to a provider instance and actual model name.
 func (r *Router) resolve(modelRef string) (Provider, string, error) {
 	// First try as a config model alias.

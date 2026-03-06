@@ -442,3 +442,62 @@ func TestParseSubtasks_EmptyInput(t *testing.T) {
 		t.Errorf("expected empty result for whitespace input, got %v", result)
 	}
 }
+
+// --- Coordinate tests ---
+
+func TestCoordinate_ReturnsNonEmptyBrief(t *testing.T) {
+	mock := &mockProvider{
+		name: "test",
+		response: &provider.ChatResponse{
+			ID:    "resp-coord-1",
+			Model: "mock-v1",
+			Message: provider.Message{
+				Role:    provider.RoleAssistant,
+				Content: "All workers should use the User struct defined in internal/model/user.go with fields ID, Name, Email.",
+			},
+			Usage: provider.Usage{PromptTokens: 100, CompletionTokens: 50, TotalTokens: 150},
+			Done:  true,
+		},
+	}
+	router := buildTestRouter(t, "mayor", mock)
+	m := NewMayor(router)
+
+	brief, err := m.Coordinate(context.Background(), "Build a REST API", []string{"Create User model", "Build API endpoints"})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if brief == "" {
+		t.Error("expected non-empty coordination brief")
+	}
+}
+
+func TestCoordinate_RecordsCost(t *testing.T) {
+	mock := &mockProvider{
+		name: "test",
+		response: &provider.ChatResponse{
+			ID:    "resp-coord-2",
+			Model: "mock-v1",
+			Message: provider.Message{
+				Role:    provider.RoleAssistant,
+				Content: "Coordination notes here.",
+			},
+			Usage: provider.Usage{PromptTokens: 80, CompletionTokens: 30, TotalTokens: 110},
+			Done:  true,
+		},
+	}
+	router := buildTestRouter(t, "mayor", mock)
+	tracker := cost.NewTracker(nil)
+	m := NewMayor(router, WithMayorCostTracker(tracker))
+
+	_, err := m.Coordinate(context.Background(), "Build API", []string{"Task 1", "Task 2"})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	records := tracker.Records()
+	if len(records) != 1 {
+		t.Fatalf("expected 1 cost record, got %d", len(records))
+	}
+	if records[0].TotalTokens != 110 {
+		t.Errorf("expected 110 total tokens, got %d", records[0].TotalTokens)
+	}
+}
