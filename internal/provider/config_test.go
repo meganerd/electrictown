@@ -476,6 +476,142 @@ defaults:
 	}
 }
 
+func TestSpecialistConfig_Valid(t *testing.T) {
+	cfg := []byte(`
+providers:
+  ollama:
+    type: ollama
+    base_url: http://localhost:11434
+models:
+  qwen-local:
+    provider: ollama
+    model: qwen3-coder:32b
+  qwen-ai01:
+    provider: ollama
+    model: qwen3-coder:80b
+roles:
+  polecat:
+    model: qwen-local
+defaults:
+  model: qwen-local
+
+specialists:
+  frontend-dev:
+    model: qwen-local
+    description: "Frontend: React, CSS, HTML"
+    pool: [qwen-local, qwen-ai01]
+  backend-dev:
+    model: qwen-ai01
+    description: "Backend: Go, Python, APIs"
+`)
+	parsed, err := ParseConfig(cfg)
+	if err != nil {
+		t.Fatalf("expected valid specialist config, got: %v", err)
+	}
+	if len(parsed.Specialists) != 2 {
+		t.Errorf("expected 2 specialists, got %d", len(parsed.Specialists))
+	}
+	fe := parsed.Specialists["frontend-dev"]
+	if fe.Model != "qwen-local" {
+		t.Errorf("expected frontend-dev model qwen-local, got %s", fe.Model)
+	}
+	if fe.Description != "Frontend: React, CSS, HTML" {
+		t.Errorf("unexpected frontend-dev description: %s", fe.Description)
+	}
+	if len(fe.Pool) != 2 {
+		t.Errorf("expected frontend-dev pool size 2, got %d", len(fe.Pool))
+	}
+
+	names := parsed.SpecialistNames()
+	if len(names) != 2 || names[0] != "backend-dev" || names[1] != "frontend-dev" {
+		t.Errorf("unexpected SpecialistNames: %v", names)
+	}
+}
+
+func TestSpecialistConfig_UnknownModel(t *testing.T) {
+	bad := []byte(`
+providers:
+  ollama:
+    type: ollama
+    base_url: http://localhost:11434
+models:
+  qwen-local:
+    provider: ollama
+    model: qwen3-coder:32b
+roles: {}
+defaults:
+  model: qwen-local
+specialists:
+  frontend-dev:
+    model: nonexistent
+`)
+	_, err := ParseConfig(bad)
+	if err == nil {
+		t.Error("expected validation error for specialist with unknown model alias")
+	}
+}
+
+func TestSpecialistConfig_UnknownPoolAlias(t *testing.T) {
+	bad := []byte(`
+providers:
+  ollama:
+    type: ollama
+    base_url: http://localhost:11434
+models:
+  qwen-local:
+    provider: ollama
+    model: qwen3-coder:32b
+roles: {}
+defaults:
+  model: qwen-local
+specialists:
+  frontend-dev:
+    model: qwen-local
+    pool: [qwen-local, nonexistent-pool]
+`)
+	_, err := ParseConfig(bad)
+	if err == nil {
+		t.Error("expected validation error for specialist pool with unknown model alias")
+	}
+}
+
+func TestSpecialistConfig_BuiltinNameConflict(t *testing.T) {
+	bad := []byte(`
+providers:
+  ollama:
+    type: ollama
+    base_url: http://localhost:11434
+models:
+  qwen-local:
+    provider: ollama
+    model: qwen3-coder:32b
+roles: {}
+defaults:
+  model: qwen-local
+specialists:
+  mayor:
+    model: qwen-local
+    description: "This conflicts with built-in role"
+`)
+	_, err := ParseConfig(bad)
+	if err == nil {
+		t.Error("expected validation error for specialist name conflicting with built-in role")
+	}
+}
+
+func TestSpecialistConfig_NoSpecialists(t *testing.T) {
+	cfg, err := ParseConfig(testConfigYAML)
+	if err != nil {
+		t.Fatalf("ParseConfig failed: %v", err)
+	}
+	if len(cfg.Specialists) != 0 {
+		t.Errorf("expected 0 specialists for config without specialists section, got %d", len(cfg.Specialists))
+	}
+	if names := cfg.SpecialistNames(); names != nil {
+		t.Errorf("expected nil SpecialistNames, got %v", names)
+	}
+}
+
 func TestResolveRole_Default(t *testing.T) {
 	cfg, err := ParseConfig(testConfigYAML)
 	if err != nil {

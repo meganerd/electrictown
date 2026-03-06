@@ -21,7 +21,10 @@ import (
 	"time"
 
 	"github.com/meganerd/electrictown/internal/build"
+	"github.com/meganerd/electrictown/internal/cache"
 	"github.com/meganerd/electrictown/internal/cost"
+	"github.com/meganerd/electrictown/internal/decision"
+	"github.com/meganerd/electrictown/internal/fileutil"
 	"github.com/meganerd/electrictown/internal/jina"
 	"github.com/meganerd/electrictown/internal/pool"
 	"github.com/meganerd/electrictown/internal/provider"
@@ -31,6 +34,7 @@ import (
 	"github.com/meganerd/electrictown/internal/provider/openai"
 	"github.com/meganerd/electrictown/internal/rag"
 	"github.com/meganerd/electrictown/internal/role"
+	"github.com/meganerd/electrictown/internal/validate"
 )
 
 var version = "dev"
@@ -112,7 +116,11 @@ Flags (run):
   --rag-url         Qdrant server URL for RAG context injection (empty = disabled)
   --rag-collection  Qdrant collection name (default: et-knowledge)
   --rag-embed-url   Ollama URL for RAG embeddings (default: http://ai01:11434)
-  --jina-key        Jina AI Reader API key for mayor-driven URL fetch (falls back to JINA_API_KEY env var)
+  --jina-key            Jina AI Reader API key for mayor-driven URL fetch (falls back to JINA_API_KEY env var)
+  --no-coordinate       Skip Phase 1.5 coordination brief generation
+  --guardrail-retries   Max retries for workers scoring below guardrail threshold (default: 1)
+  --guardrail-threshold Minimum reviewer score (1-10) before triggering retry (default: 6)
+  --no-specialists      Disable specialist routing (ignore specialists config)
 
 Flags (models, nodes):
   --config   Path to config file (default: ./electrictown.yaml, then $HOME/electrictown.yaml)
@@ -180,6 +188,10 @@ func cmdRun(args []string) error {
 	ragCollection := fs.String("rag-collection", "et-knowledge", "Qdrant collection name for RAG")
 	ragEmbedURL := fs.String("rag-embed-url", "http://ai01:11434", "Ollama URL for RAG embeddings")
 	jinaKey := fs.String("jina-key", "", "Jina AI Reader API key for mayor-driven URL fetch (falls back to JINA_API_KEY env var)")
+	noCoordinate := fs.Bool("no-coordinate", false, "skip Phase 1.5 coordination brief generation")
+	guardrailRetries := fs.Int("guardrail-retries", 1, "max retries for workers scoring below guardrail threshold")
+	guardrailThreshold := fs.Int("guardrail-threshold", 6, "minimum reviewer score (1-10) before triggering guardrail retry")
+	noSpecialists := fs.Bool("no-specialists", false, "disable specialist routing (ignore specialists config)")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -231,7 +243,7 @@ func cmdRun(args []string) error {
 	// Check if the worker role has a pool configured.
 	poolAliases := cfg.PoolForRole(workerRole)
 	if len(poolAliases) > 0 {
-		return cmdRunParallel(ctx, router, cfg, task, *supervisorRole, poolAliases, *noSynthesize, *noReviewer, *noTester, *iterate, *maxIterations, *maxSubtasks, *outputDir, runLogDir, *ragURL, *ragCollection, *ragEmbedURL, *jinaKey)
+		return cmdRunParallel(ctx, router, cfg, task, *supervisorRole, poolAliases, *noSynthesize, *noReviewer, *noTester, *iterate, *maxIterations, *maxSubtasks, *outputDir, runLogDir, *ragURL, *ragCollection, *ragEmbedURL, *jinaKey, *noCoordinate, *guardrailRetries, *guardrailThreshold, *noSpecialists)
 	}
 
 	// Legacy single-worker flow (no pool configured).
@@ -243,9 +255,16 @@ func cmdRun(args []string) error {
 //	0. RAG (optional)  0.5. Jina fetch (optional)  1. Decompose  2. Parallel workers
 //	2.5. Reviewer (optional)  3. Synthesize  4. Tester (optional)
 //	5. Build/fix loop (optional, requires --iterate)
-func cmdRunParallel(ctx context.Context, router *provider.Router, cfg *provider.Config, task, supervisorRole string, poolAliases []string, noSynthesize, noReviewer, noTester, iterate bool, maxIterations, maxSubtasks int, outputDir, runLogDir, ragURL, ragCollection, ragEmbedURL, jinaKey string) error {
+func cmdRunParallel(ctx context.Context, router *provider.Router, cfg *provider.Config, task, supervisorRole string, poolAliases []string, noSynthesize, noReviewer, noTester, iterate bool, maxIterations, maxSubtasks int, outputDir, runLogDir, ragURL, ragCollection, ragEmbedURL, jinaKey string, noCoordinate bool, guardrailRetries, guardrailThreshold int, noSpecialists bool) error {
 	// Shared cost tracker for all roles in this run.
 	tracker := cost.NewTracker(cost.DefaultPricing())
+
+	// Decision logger for observability.
+	decLog, decErr := decision.NewLogger(filepath.Join(runLogDir, "_decisions.jsonl"))
+	if decErr != nil {
+		fmt.Fprintf(os.Stderr, "  warning: decision logger: %v — continuing without\n", decErr)
+	}
+	defer decLog.Close()
 
 	// Build Mayor with options.
 	var mayorOpts []role.MayorOption
@@ -253,6 +272,11 @@ func cmdRunParallel(ctx context.Context, router *provider.Router, cfg *provider.
 	mayorOpts = append(mayorOpts, role.WithMayorCostTracker(tracker))
 	if maxSubtasks > 0 {
 		mayorOpts = append(mayorOpts, role.WithMayorMaxSubtasks(maxSubtasks))
+	}
+	// Inject specialist config into mayor for routing-aware decomposition.
+	hasSpecialists := !noSpecialists && len(cfg.Specialists) > 0
+	if hasSpecialists {
+		mayorOpts = append(mayorOpts, role.WithMayorSpecialists(cfg.Specialists))
 	}
 	mayor := role.NewMayor(router, mayorOpts...)
 
@@ -330,23 +354,127 @@ func cmdRunParallel(ctx context.Context, router *provider.Router, cfg *provider.
 	if err != nil {
 		return fmt.Errorf("supervisor decompose failed: %w", err)
 	}
+	// Parse dependency markers from subtasks.
+	deps := pool.ParseDependencies(subtasks)
+	hasDeps := pool.HasDependencies(deps)
+
+	decLog.Log(decision.Decision{
+		Phase:   "decompose",
+		Agent:   supervisorRole,
+		Intent:  "split task into parallel subtasks",
+		Action:  fmt.Sprintf("produced %d subtasks", len(subtasks)),
+		Outcome: "success",
+		Detail:  truncate(task, 120),
+	})
+
 	fmt.Printf("  Subtasks: %d\n", len(subtasks))
 	for i, st := range subtasks {
 		fmt.Printf("  [%d] %s\n", i+1, truncate(st, 100))
 	}
+	if hasDeps {
+		fmt.Printf("  Dependencies detected — will execute in waves\n")
+	}
 	fmt.Println()
 
-	// Phase 2: Parallel worker execution with live progress.
-	n := len(subtasks)
-	fmt.Printf("Phase 2: Workers executing in parallel (%d subtasks, %d pool members)...\n", n, len(poolAliases))
+	// Phase 1.25: Specialist resolution (when specialists are configured).
+	var resolvedModels []string
+	var resolvedFallbacks [][]string
+	if hasSpecialists {
+		fmt.Printf("Phase 1.25: Resolving specialist assignments...\n")
+		specialistNames := cfg.SpecialistNames()
+		resolvedModels = make([]string, len(subtasks))
+		resolvedFallbacks = make([][]string, len(subtasks))
+		specialistBalancers := make(map[string]*provider.Balancer)
 
-	balancer := provider.NewBalancer(provider.StrategyRoundRobin)
-	wp := pool.New(router, balancer, poolAliases)
+		for i, st := range subtasks {
+			assigned := pool.ParseSpecialistAssignment(st)
+			if assigned == "" {
+				// No marker — use default pool via balancer (empty override).
+				resolvedModels[i] = ""
+				fmt.Printf("  [%d] → general-default\n", i+1)
+				continue
+			}
+
+			// Check if specialist exists in config.
+			spec, ok := cfg.Specialists[assigned]
+			if !ok {
+				// Try fuzzy match.
+				if match, found := pool.FuzzyMatchSpecialist(assigned, specialistNames); found {
+					fmt.Fprintf(os.Stderr, "  ⚠ [%d] specialist %q not found, using fuzzy match %q\n", i+1, assigned, match)
+					assigned = match
+					spec = cfg.Specialists[match]
+				} else {
+					fmt.Fprintf(os.Stderr, "  ⚠ [%d] specialist %q not found, falling back to general-default\n", i+1, assigned)
+					resolvedModels[i] = ""
+
+					decLog.Log(decision.Decision{
+						Phase:   "specialist-resolve",
+						Agent:   "orchestrator",
+						Intent:  fmt.Sprintf("resolve specialist %q for subtask %d", assigned, i+1),
+						Action:  "fell back to general-default",
+						Outcome: "warning",
+						Detail:  fmt.Sprintf("specialist %q not in config", assigned),
+					})
+					continue
+				}
+			}
+
+			// Resolve model alias for this specialist.
+			if len(spec.Pool) > 0 {
+				if _, exists := specialistBalancers[assigned]; !exists {
+					specialistBalancers[assigned] = provider.NewBalancer(provider.StrategyRoundRobin)
+				}
+				resolvedModels[i] = specialistBalancers[assigned].Select(assigned, spec.Pool)
+			} else {
+				resolvedModels[i] = spec.Model
+			}
+
+			// Wire specialist fallback chain.
+			if len(spec.Fallbacks) > 0 {
+				resolvedFallbacks[i] = spec.Fallbacks
+			}
+
+			fmt.Printf("  [%d] → %s (%s)\n", i+1, assigned, resolvedModels[i])
+
+			decLog.Log(decision.Decision{
+				Phase:   "specialist-resolve",
+				Agent:   "orchestrator",
+				Intent:  fmt.Sprintf("assign subtask %d to specialist", i+1),
+				Action:  fmt.Sprintf("routed to %s via %s", assigned, resolvedModels[i]),
+				Outcome: "success",
+				Detail:  truncate(st, 120),
+			})
+		}
+		fmt.Println()
+	}
+
+	// Phase 1.5: Coordination brief (optional — skipped if --no-coordinate).
 	workerSystemPrompt := workerPrompt(outputDir)
-	// Prepend RAG context to worker system prompt if available.
 	if workerRAGContext != "" {
 		workerSystemPrompt = workerRAGContext + "\n---\n\n" + workerSystemPrompt
 	}
+	if !noCoordinate && len(subtasks) > 1 {
+		fmt.Printf("Phase 1.5: Mayor producing coordination brief...\n")
+		stopSpin15 := startSpinner(spinLabelWithToks("  coordinating", tracker))
+		brief, coordErr := mayor.Coordinate(ctx, task, subtasks)
+		stopSpin15()
+		if coordErr != nil {
+			fmt.Fprintf(os.Stderr, "  warning: coordination brief failed: %v — continuing without\n", coordErr)
+		} else if brief != "" {
+			workerSystemPrompt = "## Project Coordination\n" + brief + "\n---\n\n" + workerSystemPrompt
+			fmt.Printf("  ✓ coordination brief injected (%d chars)\n", len(brief))
+		}
+		fmt.Println()
+	}
+
+	// Initialize response cache for deduplication in build/fix iterations.
+	responseCache := cache.New()
+	_ = responseCache // used in Phase 5
+
+	// Phase 2: Worker execution (parallel or DAG-ordered).
+	n := len(subtasks)
+	balancer := provider.NewBalancer(provider.StrategyRoundRobin)
+	wp := pool.New(router, balancer, poolAliases)
 
 	lp := newLiveProgress(n)
 	wp.SetProgressHook(func(idx int, r role.WorkerResult) {
@@ -363,10 +491,68 @@ func cmdRunParallel(ctx context.Context, router *provider.Router, cfg *provider.
 			idx+1, n, truncate(r.Role, 18), status, toks, tps, r.Elapsed.Seconds()))
 	})
 
-	results := wp.ExecuteAll(ctx, subtasks, workerSystemPrompt)
+	var results []role.WorkerResult
+	if hasDeps {
+		fmt.Printf("Phase 2: Workers executing with dependency ordering (%d subtasks, %d pool members)...\n", n, len(poolAliases))
+		var dagErr error
+		if resolvedModels != nil {
+			results, dagErr = wp.ExecuteDAGWithModels(ctx, subtasks, deps, resolvedModels, resolvedFallbacks, workerSystemPrompt)
+		} else {
+			results, dagErr = wp.ExecuteDAG(ctx, subtasks, deps, workerSystemPrompt)
+		}
+		if dagErr != nil {
+			return fmt.Errorf("DAG execution failed: %w", dagErr)
+		}
+	} else {
+		fmt.Printf("Phase 2: Workers executing in parallel (%d subtasks, %d pool members)...\n", n, len(poolAliases))
+		if resolvedModels != nil {
+			results = wp.ExecuteAllWithModels(ctx, subtasks, resolvedModels, resolvedFallbacks, workerSystemPrompt)
+		} else {
+			results = wp.ExecuteAll(ctx, subtasks, workerSystemPrompt)
+		}
+	}
 	fmt.Println()
 
-	// Phase 2.5: Reviewer (optional — skipped if --no-reviewer or role not configured).
+	// Phase 2.25: Structured output validation (when --output-dir is set).
+	if outputDir != "" {
+		validationRetried := 0
+		for i := range results {
+			if strings.HasPrefix(results[i].Response, "error:") {
+				continue
+			}
+			ok, valErrs := validate.ValidateFileBlocks(results[i].Response)
+			if ok {
+				continue
+			}
+			validationRetried++
+			fmt.Printf("  ⚠ worker[%d] output validation failed: %s\n", i+1, strings.Join(valErrs, "; "))
+			// Retry once with validation feedback.
+			retryPrompt := fmt.Sprintf(
+				"Your previous output had format errors:\n%s\n\nOriginal subtask: %s\n\nPlease output corrected files using ===FILE: path=== ... ===ENDFILE=== format.",
+				strings.Join(valErrs, "\n"), results[i].Subtask,
+			)
+			retryReq := &provider.ChatRequest{
+				Model: results[i].Role,
+				Messages: []provider.Message{
+					{Role: provider.RoleSystem, Content: workerSystemPrompt},
+					{Role: provider.RoleUser, Content: retryPrompt},
+				},
+			}
+			resp, retryErr := router.ChatCompletion(ctx, retryReq)
+			if retryErr != nil {
+				fmt.Fprintf(os.Stderr, "  validation retry[%d] failed: %v\n", i+1, retryErr)
+				continue
+			}
+			results[i].Response = resp.Message.Content
+			results[i].Tokens += resp.Usage.TotalTokens
+			fmt.Printf("  ✓ worker[%d] re-submitted after validation fix\n", i+1)
+		}
+		if validationRetried > 0 {
+			fmt.Println()
+		}
+	}
+
+	// Phase 2.5: Reviewer + guardrail retries (optional).
 	if !noReviewer {
 		if _, ok := cfg.Roles["reviewer"]; ok {
 			fmt.Printf("Phase 2.5: Reviewer scoring worker outputs...\n")
@@ -375,19 +561,91 @@ func cmdRunParallel(ctx context.Context, router *provider.Router, cfg *provider.
 				if strings.HasPrefix(results[i].Response, "error:") {
 					continue
 				}
-				score, note, err := reviewer.Score(ctx, results[i].Subtask, results[i].Response)
-				if err != nil {
-					fmt.Fprintf(os.Stderr, "  reviewer[%d]: %v\n", i+1, err)
+				score, note, scoreErr := reviewer.Score(ctx, results[i].Subtask, results[i].Response)
+				if scoreErr != nil {
+					fmt.Fprintf(os.Stderr, "  reviewer[%d]: %v\n", i+1, scoreErr)
 					continue
 				}
 				results[i].ReviewScore = score
 				results[i].ReviewNote = note
-				results[i].Flagged = score > 0 && score < 6
+				results[i].Flagged = score > 0 && score < guardrailThreshold
+
+				decLog.Log(decision.Decision{
+					Phase:     "review",
+					Agent:     "reviewer",
+					Intent:    fmt.Sprintf("score worker %d output", i+1),
+					Action:    fmt.Sprintf("scored %d/10", score),
+					Outcome:   map[bool]string{true: "flagged", false: "passed"}[results[i].Flagged],
+					Detail:    truncate(note, 120),
+					TokenCost: results[i].Tokens,
+				})
+
+				// Guardrail retry loop: re-dispatch workers scoring below threshold.
+				guardDoom := pool.NewDoomLoop()
+				guardDoom.Check(results[i].Response) // seed with original response
+				retryCount := 0
+				for results[i].Flagged && retryCount < guardrailRetries {
+					retryCount++
+					fmt.Printf("  [%d/%d] score=%d/10 ⚑ retrying (%d/%d): %s\n",
+						i+1, len(results), score, retryCount, guardrailRetries, truncate(note, 60))
+					retryPrompt := fmt.Sprintf(
+						"Your previous output scored %d/10. Reviewer feedback: %s\n\nOriginal subtask: %s\n\nPlease revise your output to address the reviewer's feedback.",
+						score, note, results[i].Subtask,
+					)
+					retryReq := &provider.ChatRequest{
+						Model: results[i].Role,
+						Messages: []provider.Message{
+							{Role: provider.RoleSystem, Content: workerSystemPrompt},
+							{Role: provider.RoleUser, Content: retryPrompt},
+						},
+					}
+					resp, retryErr := router.ChatCompletion(ctx, retryReq)
+					if retryErr != nil {
+						fmt.Fprintf(os.Stderr, "  guardrail retry[%d]: %v\n", i+1, retryErr)
+						break
+					}
+					results[i].Response = resp.Message.Content
+					results[i].Tokens += resp.Usage.TotalTokens
+
+					// Doom-loop detection: abort if worker produces identical output.
+					if guardDoom.Check(results[i].Response) {
+						fmt.Fprintf(os.Stderr, "  ⚠ worker[%d] doom loop: identical output after retry — aborting\n", i+1)
+						decLog.Log(decision.Decision{
+							Phase:   "guardrail",
+							Agent:   results[i].Role,
+							Intent:  "improve output via retry",
+							Action:  "doom loop detected — aborted",
+							Outcome: "failure",
+							Detail:  "identical response after feedback retry",
+						})
+						break
+					}
+
+					// Re-score the revised output.
+					score, note, scoreErr = reviewer.Score(ctx, results[i].Subtask, results[i].Response)
+					if scoreErr != nil {
+						fmt.Fprintf(os.Stderr, "  guardrail re-score[%d]: %v\n", i+1, scoreErr)
+						break
+					}
+					results[i].ReviewScore = score
+					results[i].ReviewNote = note
+					results[i].Flagged = score > 0 && score < guardrailThreshold
+
+					decLog.Log(decision.Decision{
+						Phase:   "guardrail",
+						Agent:   results[i].Role,
+						Intent:  "improve output via retry",
+						Action:  fmt.Sprintf("re-scored %d/10 after retry %d", score, retryCount),
+						Outcome: map[bool]string{true: "still-flagged", false: "improved"}[results[i].Flagged],
+						Detail:  truncate(note, 120),
+					})
+				}
+
 				flag := "✓"
 				if results[i].Flagged {
 					flag = "⚑"
 				}
-				fmt.Printf("  [%d/%d] score=%d/10 %s %s\n", i+1, len(results), score, flag, truncate(note, 80))
+				fmt.Printf("  [%d/%d] score=%d/10 %s %s\n", i+1, len(results), results[i].ReviewScore, flag, truncate(results[i].ReviewNote, 80))
 			}
 			fmt.Println()
 		} else {
@@ -464,6 +722,7 @@ func cmdRunParallel(ctx context.Context, router *provider.Router, cfg *provider.
 			fmt.Fprintf(os.Stderr, "  note: no build system detected in %s — skipping Phase 5\n", outputDir)
 		} else {
 			fmt.Printf("Phase 5: Iterative build/fix loop (%s, max %d iterations)...\n", runner.Name(), maxIterations)
+			buildDoom := pool.NewDoomLoop()
 			buildOK := false
 			for iter := 1; iter <= maxIterations; iter++ {
 				fmt.Printf("  [iter %d/%d] building...\n", iter, maxIterations)
@@ -484,6 +743,20 @@ func cmdRunParallel(ctx context.Context, router *provider.Router, cfg *provider.
 
 				fmt.Printf("  ✗ Build failed:\n")
 				fmt.Println(build.ErrorSummary(stderr, 20))
+
+				// Doom-loop detection: abort if identical errors repeat.
+				if buildDoom.Check(stderr) {
+					fmt.Fprintf(os.Stderr, "  ⚠ build doom loop: identical errors after fix — aborting\n")
+					decLog.Log(decision.Decision{
+						Phase:   "build-fix",
+						Agent:   "builder",
+						Intent:  "fix build errors",
+						Action:  "doom loop detected — aborted",
+						Outcome: "failure",
+						Detail:  "identical build errors after worker fix attempt",
+					})
+					break
+				}
 
 				if iter == maxIterations {
 					break
@@ -805,13 +1078,10 @@ func parseMultiFileBlocks(response string) []FileOutput {
 	return files
 }
 
-// writeOutputFile writes content to path/filename, creating parent directories.
+// writeOutputFile writes content to path/filename atomically (temp + rename).
 func writeOutputFile(dir, filename, content string) error {
 	fullPath := filepath.Join(dir, filename)
-	if err := os.MkdirAll(filepath.Dir(fullPath), 0755); err != nil {
-		return fmt.Errorf("create directories for %s: %w", fullPath, err)
-	}
-	return os.WriteFile(fullPath, []byte(content), 0644)
+	return fileutil.AtomicWrite(fullPath, []byte(content), 0644)
 }
 
 // startSpinner launches an animated spinner on stderr. labelFn is called on

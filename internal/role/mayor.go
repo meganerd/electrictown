@@ -48,6 +48,7 @@ type Mayor struct {
 	role         string
 	systemPrompt string
 	maxSubtasks  int
+	specialists  map[string]provider.SpecialistConfig // nil when no specialists configured
 }
 
 const defaultMayorSystemPrompt = `You are a software architect decomposing a task into implementation subtasks for parallel coding workers.
@@ -57,6 +58,7 @@ RULES:
 - Each subtask must produce complete, working, compilable source code — not setup instructions.
 - Name the specific files and Go packages the worker should write.
 - Workers run in parallel and cannot see each other's output, so define any shared interfaces inline in the subtask description so workers agree on them.
+- If a subtask depends on another subtask's output (e.g. "implement User API" needs "User model" first), append [depends: N] where N is the subtask number it depends on. Multiple dependencies: [depends: 1,3]. Subtasks with no dependencies run in parallel.
 - Generate as many subtasks as the task genuinely requires (no artificial limit).
 - Output ONLY a numbered list of subtasks. No headings, no preamble, no prose.`
 
@@ -102,13 +104,64 @@ func WithMayorMaxSubtasks(n int) MayorOption {
 	}
 }
 
+// WithMayorSpecialists configures specialist routing. When set, the decompose
+// prompt is augmented with specialist names and descriptions so the mayor can
+// assign subtasks to domain-specific workers.
+func WithMayorSpecialists(specialists map[string]provider.SpecialistConfig) MayorOption {
+	return func(m *Mayor) {
+		m.specialists = specialists
+	}
+}
+
+// buildDecomposePrompt returns the system prompt for decomposition, optionally
+// augmented with specialist routing instructions.
+func (m *Mayor) buildDecomposePrompt() string {
+	if len(m.specialists) == 0 {
+		return m.systemPrompt
+	}
+
+	var sb strings.Builder
+	sb.WriteString(m.systemPrompt)
+	sb.WriteString("\n\nAVAILABLE SPECIALISTS (assign using [specialist: name] marker):\n")
+
+	// Sort for deterministic output.
+	names := make([]string, 0, len(m.specialists))
+	for name := range m.specialists {
+		names = append(names, name)
+	}
+	// Simple sort without importing sort (already used in strings).
+	for i := 0; i < len(names); i++ {
+		for j := i + 1; j < len(names); j++ {
+			if names[i] > names[j] {
+				names[i], names[j] = names[j], names[i]
+			}
+		}
+	}
+
+	for _, name := range names {
+		sc := m.specialists[name]
+		desc := sc.Description
+		if desc == "" {
+			desc = "specialist worker"
+		}
+		fmt.Fprintf(&sb, "- %s: %s\n", name, desc)
+	}
+	sb.WriteString("- general-default: General-purpose coding (used when no specialist matches)\n")
+	sb.WriteString("\nRules:\n")
+	sb.WriteString("- Append [specialist: name] when a subtask clearly matches a specialist's expertise.\n")
+	sb.WriteString("- Omit the marker for general-purpose work (general-default will be used).\n")
+	sb.WriteString("- Use ONLY specialist names from the list above.\n")
+
+	return sb.String()
+}
+
 // Decompose takes a high-level task description and returns a list of discrete
 // subtasks for workers. It sends the task to the supervisor model and parses
 // the response into individual subtask strings.
 func (m *Mayor) Decompose(ctx context.Context, task string) ([]string, error) {
 	req := &provider.ChatRequest{
 		Messages: []provider.Message{
-			{Role: provider.RoleSystem, Content: m.systemPrompt},
+			{Role: provider.RoleSystem, Content: m.buildDecomposePrompt()},
 			{Role: provider.RoleUser, Content: fmt.Sprintf("Decompose this task into subtasks:\n\n%s", task)},
 		},
 	}
@@ -280,6 +333,42 @@ func ParseAssessResult(text string) *AssessResult {
 		FetchURLs:     raw.FetchURLs,
 		StalenessRisk: raw.StalenessRisk,
 	}
+}
+
+const coordinateSystemPrompt = `You are a software architect. Given a task and its subtask decomposition, produce a brief coordination document (under 300 words) describing:
+- Shared interfaces or types that multiple workers must agree on
+- Naming conventions and package structure
+- Any cross-subtask dependencies or integration points
+
+Output ONLY the coordination document — no preamble, no headers. Workers will receive this as project context.`
+
+// Coordinate produces a coordination brief that describes shared interfaces,
+// conventions, and integration points for a set of subtasks. The brief is
+// designed to be injected into worker system prompts so all workers share
+// the same architectural context.
+func (m *Mayor) Coordinate(ctx context.Context, task string, subtasks []string) (string, error) {
+	var sb strings.Builder
+	sb.WriteString("Task: ")
+	sb.WriteString(task)
+	sb.WriteString("\n\nSubtasks:\n")
+	for i, st := range subtasks {
+		fmt.Fprintf(&sb, "%d. %s\n", i+1, st)
+	}
+
+	req := &provider.ChatRequest{
+		Messages: []provider.Message{
+			{Role: provider.RoleSystem, Content: coordinateSystemPrompt},
+			{Role: provider.RoleUser, Content: sb.String()},
+		},
+	}
+
+	resp, err := m.router.ChatCompletionForRole(ctx, m.role, req)
+	if err != nil {
+		return "", err
+	}
+
+	m.recordCost(resp)
+	return strings.TrimSpace(resp.Message.Content), nil
 }
 
 // recordCost records token usage with the cost tracker if one is configured.
