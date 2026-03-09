@@ -5,7 +5,9 @@ package decision
 
 import (
 	"encoding/json"
+	"fmt"
 	"os"
+	"path/filepath"
 	"sync"
 	"time"
 )
@@ -36,9 +38,12 @@ func NewLogger(path string) (*Logger, error) {
 	if path == "" {
 		return nil, nil
 	}
+	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
+		return nil, fmt.Errorf("create log directory: %w", err)
+	}
 	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("open decision log: %w", err)
 	}
 	return &Logger{
 		file: f,
