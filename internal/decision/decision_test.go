@@ -140,3 +140,68 @@ func TestLogger_PreservesExplicitTimestamp(t *testing.T) {
 		t.Errorf("timestamp = %q, want explicit value", d.Timestamp)
 	}
 }
+
+func TestNewLogger_CreatesParentDirectories(t *testing.T) {
+	dir := t.TempDir()
+	nested := filepath.Join(dir, "a", "b", "c", "decisions.jsonl")
+
+	l, err := NewLogger(nested)
+	if err != nil {
+		t.Fatalf("NewLogger failed for nested path: %v", err)
+	}
+	defer l.Close()
+
+	// Verify the directory was created
+	fi, err := os.Stat(filepath.Dir(nested))
+	if err != nil {
+		t.Fatalf("parent directory not created: %v", err)
+	}
+	if !fi.IsDir() {
+		t.Error("expected directory, got file")
+	}
+
+	// Verify logging works
+	l.Log(Decision{Phase: "test", Agent: "test"})
+	l.Close()
+
+	data, err := os.ReadFile(nested)
+	if err != nil {
+		t.Fatalf("cannot read log file: %v", err)
+	}
+	if len(data) == 0 {
+		t.Error("log file is empty after writing")
+	}
+}
+
+func TestNewLogger_ErrorMessageOnFailure(t *testing.T) {
+	// Try to create logger in a path where we can't write
+	// (file as parent directory — can't mkdir through a file)
+	dir := t.TempDir()
+	blockingFile := filepath.Join(dir, "blocker")
+	if err := os.WriteFile(blockingFile, []byte("x"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	badPath := filepath.Join(blockingFile, "sub", "decisions.jsonl")
+	_, err := NewLogger(badPath)
+	if err == nil {
+		t.Fatal("expected error when parent is a file, got nil")
+	}
+	// Error should be descriptive
+	if !contains(err.Error(), "create log directory") && !contains(err.Error(), "not a directory") {
+		t.Errorf("error should mention directory creation, got: %v", err)
+	}
+}
+
+func contains(s, substr string) bool {
+	return len(s) >= len(substr) && (s == substr || len(s) > 0 && containsInner(s, substr))
+}
+
+func containsInner(s, substr string) bool {
+	for i := 0; i <= len(s)-len(substr); i++ {
+		if s[i:i+len(substr)] == substr {
+			return true
+		}
+	}
+	return false
+}

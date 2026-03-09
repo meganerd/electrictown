@@ -10,6 +10,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -18,6 +19,7 @@ import (
 	"regexp"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/meganerd/electrictown/internal/build"
@@ -182,7 +184,7 @@ func cmdRun(args []string) error {
 	iterate := fs.Bool("iterate", false, "enable Phase 5 iterative build/fix loop (requires --output-dir)")
 	maxIterations := fs.Int("max-iterations", 3, "max build/fix iterations for --iterate (default: 3)")
 	maxSubtasks := fs.Int("max-subtasks", 0, "max subtasks (0 = use Mayor default of 10)")
-	timeoutMins := fs.Int("timeout", 30, "total timeout in minutes for the entire run")
+	timeoutMins := fs.Int("timeout", 45, "total timeout in minutes for the entire run")
 	outputDir := fs.String("output-dir", "", "directory to write output files (default: stdout only)")
 	ragURL := fs.String("rag-url", "", "Qdrant server URL for RAG context injection (empty = disabled)")
 	ragCollection := fs.String("rag-collection", "et-knowledge", "Qdrant collection name for RAG")
@@ -233,12 +235,16 @@ func cmdRun(args []string) error {
 		return fmt.Errorf("generating run ID: %w", err)
 	}
 	runLogDir := filepath.Join(baseLogDir, time.Now().Format("2006-01-02")+"_"+runID)
+	if err := os.MkdirAll(runLogDir, 0755); err != nil {
+		fmt.Fprintf(os.Stderr, "  warning: cannot create log directory %s: %s — continuing without logs\n", runLogDir, classifyFSError(err))
+	}
 
 	fmt.Printf("electrictown %s\n", version)
 	fmt.Printf("============\n")
 	fmt.Printf("Config: %s\n", resolvedConfig)
 	fmt.Printf("Task:   %s\n", task)
-	fmt.Printf("Logs:   %s\n\n", runLogDir)
+	fmt.Printf("Logs:   %s\n", runLogDir)
+	fmt.Printf("Start:  %s\n\n", time.Now().Format("15:04:05"))
 
 	// Check if the worker role has a pool configured.
 	poolAliases := cfg.PoolForRole(workerRole)
@@ -258,6 +264,9 @@ func cmdRun(args []string) error {
 func cmdRunParallel(ctx context.Context, router *provider.Router, cfg *provider.Config, task, supervisorRole string, poolAliases []string, noSynthesize, noReviewer, noTester, iterate bool, maxIterations, maxSubtasks int, outputDir, runLogDir, ragURL, ragCollection, ragEmbedURL, jinaKey string, noCoordinate bool, guardrailRetries, guardrailThreshold int, noSpecialists bool) error {
 	// Shared cost tracker for all roles in this run.
 	tracker := cost.NewTracker(cost.DefaultPricing())
+
+	// Phase timing tracker.
+	pt := newPhaseTracker()
 
 	// Decision logger for observability.
 	decLog, decErr := decision.NewLogger(filepath.Join(runLogDir, "_decisions.jsonl"))
@@ -313,6 +322,7 @@ func cmdRunParallel(ctx context.Context, router *provider.Router, cfg *provider.
 	}
 	if resolvedJinaKey != "" {
 		fmt.Printf("Phase 0.5: Mayor assessing knowledge staleness...\n")
+		pt.start("Phase 0.5 assess")
 		stopSpin05 := startSpinner(spinLabelWithToks("  assessing", tracker))
 		assess, assessErr := mayor.Assess(ctx, task)
 		stopSpin05()
@@ -343,11 +353,13 @@ func cmdRunParallel(ctx context.Context, router *provider.Router, cfg *provider.
 				}
 			}
 		}
+		pt.stop()
 		fmt.Println()
 	}
 
 	// Phase 1: Decompose (with spinner showing live token count).
 	fmt.Printf("Phase 1: Supervisor (%s) decomposing task...\n", supervisorRole)
+	pt.start("Phase 1 decompose")
 	stopSpin1 := startSpinner(spinLabelWithToks("  decomposing", tracker))
 	subtasks, err := mayor.Decompose(ctx, decomposeTask)
 	stopSpin1()
@@ -374,6 +386,7 @@ func cmdRunParallel(ctx context.Context, router *provider.Router, cfg *provider.
 	if hasDeps {
 		fmt.Printf("  Dependencies detected — will execute in waves\n")
 	}
+	pt.stop()
 	fmt.Println()
 
 	// Phase 1.25: Specialist resolution (when specialists are configured).
@@ -455,6 +468,7 @@ func cmdRunParallel(ctx context.Context, router *provider.Router, cfg *provider.
 	}
 	if !noCoordinate && len(subtasks) > 1 {
 		fmt.Printf("Phase 1.5: Mayor producing coordination brief...\n")
+		pt.start("Phase 1.5 coordinate")
 		stopSpin15 := startSpinner(spinLabelWithToks("  coordinating", tracker))
 		brief, coordErr := mayor.Coordinate(ctx, task, subtasks)
 		stopSpin15()
@@ -464,6 +478,7 @@ func cmdRunParallel(ctx context.Context, router *provider.Router, cfg *provider.
 			workerSystemPrompt = "## Project Coordination\n" + brief + "\n---\n\n" + workerSystemPrompt
 			fmt.Printf("  ✓ coordination brief injected (%d chars)\n", len(brief))
 		}
+		pt.stop()
 		fmt.Println()
 	}
 
@@ -492,6 +507,7 @@ func cmdRunParallel(ctx context.Context, router *provider.Router, cfg *provider.
 	})
 
 	var results []role.WorkerResult
+	pt.start("Phase 2 workers")
 	if hasDeps {
 		fmt.Printf("Phase 2: Workers executing with dependency ordering (%d subtasks, %d pool members)...\n", n, len(poolAliases))
 		var dagErr error
@@ -511,6 +527,7 @@ func cmdRunParallel(ctx context.Context, router *provider.Router, cfg *provider.
 			results = wp.ExecuteAll(ctx, subtasks, workerSystemPrompt)
 		}
 	}
+	pt.stop()
 	fmt.Println()
 
 	// Phase 2.25: Structured output validation (when --output-dir is set).
@@ -556,6 +573,7 @@ func cmdRunParallel(ctx context.Context, router *provider.Router, cfg *provider.
 	if !noReviewer {
 		if _, ok := cfg.Roles["reviewer"]; ok {
 			fmt.Printf("Phase 2.5: Reviewer scoring worker outputs...\n")
+			pt.start("Phase 2.5 reviewer")
 			reviewer := role.NewReviewer(router, role.WithWitnessCostTracker(tracker))
 			for i := range results {
 				if strings.HasPrefix(results[i].Response, "error:") {
@@ -647,6 +665,7 @@ func cmdRunParallel(ctx context.Context, router *provider.Router, cfg *provider.
 				}
 				fmt.Printf("  [%d/%d] score=%d/10 %s %s\n", i+1, len(results), results[i].ReviewScore, flag, truncate(results[i].ReviewNote, 80))
 			}
+			pt.stop()
 			fmt.Println()
 		} else {
 			fmt.Fprintf(os.Stderr, "  note: reviewer role not configured — skipping Phase 2.5\n")
@@ -670,17 +689,20 @@ func cmdRunParallel(ctx context.Context, router *provider.Router, cfg *provider.
 	}
 
 	fmt.Printf("Phase 3: Supervisor synthesizing results...\n")
+	pt.start("Phase 3 synthesize")
 	stopSpin3 := startSpinner(spinLabelWithToks("  synthesizing", tracker))
 	synthesis, err := mayor.Synthesize(ctx, task, results)
 	stopSpin3()
 	if err != nil {
-		return fmt.Errorf("supervisor synthesize failed: %w", err)
+		return fmt.Errorf("supervisor synthesize failed (during %s): %w", pt.currentPhase(), err)
 	}
+	pt.stop()
 
 	// Phase 4: Tester polish (optional — skipped if --no-tester or role not configured).
 	if !noTester {
 		if _, ok := cfg.Roles["tester"]; ok {
 			fmt.Printf("Phase 4: Tester polishing synthesized output...\n")
+			pt.start("Phase 4 tester")
 			stopSpin4 := startSpinner(spinLabelWithToks("  refining", tracker))
 			tester := role.NewTester(router, role.WithRefineryCostTracker(tracker))
 			refined, err := tester.Refine(ctx, synthesis)
@@ -691,6 +713,7 @@ func cmdRunParallel(ctx context.Context, router *provider.Router, cfg *provider.
 				synthesis = refined.Message.Content
 				fmt.Printf("  Tester refined output (%d tokens)\n", refined.Usage.TotalTokens)
 			}
+			pt.stop()
 			fmt.Println()
 		} else {
 			fmt.Fprintf(os.Stderr, "  note: tester role not configured — skipping Phase 4\n")
@@ -790,6 +813,11 @@ func cmdRunParallel(ctx context.Context, router *provider.Router, cfg *provider.
 			fmt.Println()
 		}
 	}
+
+	// Phase timing summary.
+	fmt.Printf("\n--- Phase Timing ---\n")
+	fmt.Print(pt.summary())
+	fmt.Printf("--------------------\n")
 
 	// Token summary by role.
 	sum := tracker.Summary()
@@ -955,9 +983,17 @@ func friendlyError(err error) string {
 	case strings.Contains(msg, "no such host"):
 		return msg + "\n  hint: hostname could not be resolved — verify the base_url in your config points to a reachable host"
 	case strings.Contains(msg, "context deadline exceeded") || strings.Contains(msg, "deadline exceeded"):
-		return msg + "\n  hint: the request timed out — the model may be loading or the host may be overloaded"
+		return msg + "\n  hint: the request timed out — increase --timeout or use --no-reviewer/--no-tester to skip slow phases"
 	case strings.Contains(msg, "x-api-key") || strings.Contains(msg, "authentication") || strings.Contains(msg, "Unauthorized") || strings.Contains(msg, "unauthorized"):
 		return msg + "\n  hint: check that your API key environment variable is exported in your shell"
+	case strings.Contains(msg, "permission denied"):
+		return msg + "\n  hint: check file/directory ownership and permissions"
+	case strings.Contains(msg, "read-only file system"):
+		return msg + "\n  hint: the target path is on a read-only mount — choose a writable directory"
+	case strings.Contains(msg, "no space left on device"):
+		return msg + "\n  hint: free disk space or choose a different output/log directory"
+	case strings.Contains(msg, "disk quota exceeded"):
+		return msg + "\n  hint: disk quota exceeded — free space or increase quota"
 	default:
 		return msg
 	}
@@ -1115,14 +1151,16 @@ func startSpinner(labelFn func() string) func() {
 // spinLabel returns a static label function for startSpinner.
 func spinLabel(s string) func() string { return func() string { return s } }
 
-// spinLabelWithToks returns a label function that appends a live token count.
+// spinLabelWithToks returns a label function that appends a live token count and elapsed time.
 func spinLabelWithToks(base string, tracker *cost.Tracker) func() string {
+	start := time.Now()
 	return func() string {
+		elapsed := time.Since(start).Seconds()
 		total := tracker.Summary().TotalTokens
 		if total == 0 {
-			return base
+			return fmt.Sprintf("%s [%.0fs]", base, elapsed)
 		}
-		return fmt.Sprintf("%s [%s tok]", base, formatToks(total))
+		return fmt.Sprintf("%s [%s tok, %.0fs]", base, formatToks(total), elapsed)
 	}
 }
 
@@ -1219,4 +1257,87 @@ func buildFixSubtasks(workerErrors map[int][]build.BuildError, outputDir string)
 		subtasks = append(subtasks, sb.String())
 	}
 	return subtasks
+}
+
+// phaseTracker tracks elapsed time per phase and cumulative run time.
+type phaseTracker struct {
+	runStart   time.Time
+	phaseStart time.Time
+	phaseName  string
+	phases     []phaseRecord
+	mu         sync.Mutex
+}
+
+type phaseRecord struct {
+	name    string
+	elapsed time.Duration
+}
+
+func newPhaseTracker() *phaseTracker {
+	now := time.Now()
+	return &phaseTracker{runStart: now}
+}
+
+func (pt *phaseTracker) start(name string) {
+	pt.mu.Lock()
+	defer pt.mu.Unlock()
+	pt.phaseName = name
+	pt.phaseStart = time.Now()
+}
+
+func (pt *phaseTracker) stop() time.Duration {
+	pt.mu.Lock()
+	defer pt.mu.Unlock()
+	elapsed := time.Since(pt.phaseStart)
+	if pt.phaseName != "" {
+		pt.phases = append(pt.phases, phaseRecord{name: pt.phaseName, elapsed: elapsed})
+	}
+	cumulative := time.Since(pt.runStart)
+	fmt.Printf("  done (%.1fs, cumulative %.1fs)\n", elapsed.Seconds(), cumulative.Seconds())
+	return elapsed
+}
+
+func (pt *phaseTracker) currentPhase() string {
+	pt.mu.Lock()
+	defer pt.mu.Unlock()
+	return pt.phaseName
+}
+
+func (pt *phaseTracker) summary() string {
+	pt.mu.Lock()
+	defer pt.mu.Unlock()
+	var sb strings.Builder
+	sb.WriteString(fmt.Sprintf("%-20s %s\n", "PHASE", "ELAPSED"))
+	sb.WriteString(fmt.Sprintf("%-20s %s\n", "-----", "-------"))
+	for _, p := range pt.phases {
+		sb.WriteString(fmt.Sprintf("%-20s %.1fs\n", p.name, p.elapsed.Seconds()))
+	}
+	total := time.Since(pt.runStart)
+	sb.WriteString(fmt.Sprintf("%-20s %.1fs\n", "TOTAL", total.Seconds()))
+	return sb.String()
+}
+
+// classifyFSError returns a user-friendly description of filesystem errors.
+func classifyFSError(err error) string {
+	if err == nil {
+		return ""
+	}
+	var pathErr *os.PathError
+	if errors.As(err, &pathErr) {
+		err = pathErr.Err
+	}
+	var errno syscall.Errno
+	if errors.As(err, &errno) {
+		switch errno {
+		case syscall.EACCES:
+			return "permission denied — check directory ownership and permissions"
+		case syscall.EROFS:
+			return "read-only file system — the mount point does not allow writes"
+		case syscall.ENOSPC:
+			return "no space left on device — free disk space or choose a different path"
+		case syscall.EDQUOT:
+			return "disk quota exceeded — free space or increase quota"
+		}
+	}
+	return err.Error()
 }
