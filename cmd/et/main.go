@@ -9,6 +9,7 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"errors"
 	"flag"
@@ -118,11 +119,13 @@ Flags (run):
   --rag-url         Qdrant server URL for RAG context injection (empty = disabled)
   --rag-collection  Qdrant collection name (default: et-knowledge)
   --rag-embed-url   Ollama URL for RAG embeddings (default: http://ai01:11434)
+  --rag-auto-ingest     Auto-ingest current working directory into RAG before run (requires --rag-url)
   --jina-key            Jina AI Reader API key for mayor-driven URL fetch (falls back to JINA_API_KEY env var)
   --no-coordinate       Skip Phase 1.5 coordination brief generation
   --guardrail-retries   Max retries for workers scoring below guardrail threshold (default: 1)
   --guardrail-threshold Minimum reviewer score (1-10) before triggering retry (default: 6)
   --no-specialists      Disable specialist routing (ignore specialists config)
+  --env-file            Path to KEY=VALUE file to load into environment before execution
 
 Flags (models, nodes):
   --config   Path to config file (default: ./electrictown.yaml, then $HOME/electrictown.yaml)
@@ -130,6 +133,43 @@ Flags (models, nodes):
 Run 'et session --help' for session management details.
 Run 'et rag ingest --help', 'et rag query --help', or 'et rag stats --help' for RAG details.
 `)
+}
+
+// loadEnvFile reads a file of KEY=VALUE pairs and sets each as an environment
+// variable. Lines starting with # and empty lines are skipped. Inline comments
+// are not supported (the value extends to end of line). Surrounding quotes on
+// values are stripped.
+func loadEnvFile(path string) error {
+	f, err := os.Open(path)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+
+	scanner := bufio.NewScanner(f)
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		key, value, ok := strings.Cut(line, "=")
+		if !ok {
+			continue
+		}
+		key = strings.TrimSpace(key)
+		value = strings.TrimSpace(value)
+		// Strip matching surrounding quotes.
+		if len(value) >= 2 {
+			if (value[0] == '"' && value[len(value)-1] == '"') ||
+				(value[0] == '\'' && value[len(value)-1] == '\'') {
+				value = value[1 : len(value)-1]
+			}
+		}
+		if err := os.Setenv(key, value); err != nil {
+			return fmt.Errorf("setting %s: %w", key, err)
+		}
+	}
+	return scanner.Err()
 }
 
 // buildFactories returns the provider factory map wiring all four adapters.
@@ -194,8 +234,17 @@ func cmdRun(args []string) error {
 	guardrailRetries := fs.Int("guardrail-retries", 1, "max retries for workers scoring below guardrail threshold")
 	guardrailThreshold := fs.Int("guardrail-threshold", 6, "minimum reviewer score (1-10) before triggering guardrail retry")
 	noSpecialists := fs.Bool("no-specialists", false, "disable specialist routing (ignore specialists config)")
+	ragAutoIngest := fs.Bool("rag-auto-ingest", false, "auto-ingest current working directory into RAG before run (requires --rag-url)")
+	envFile := fs.String("env-file", "", "path to file of KEY=VALUE pairs to load into environment")
 	if err := fs.Parse(args); err != nil {
 		return err
+	}
+
+	// Load env file before any provider/worker initialization.
+	if *envFile != "" {
+		if err := loadEnvFile(*envFile); err != nil {
+			return fmt.Errorf("loading env file: %w", err)
+		}
 	}
 
 	task := strings.Join(fs.Args(), " ")
@@ -249,7 +298,7 @@ func cmdRun(args []string) error {
 	// Check if the worker role has a pool configured.
 	poolAliases := cfg.PoolForRole(workerRole)
 	if len(poolAliases) > 0 {
-		return cmdRunParallel(ctx, router, cfg, task, *supervisorRole, poolAliases, *noSynthesize, *noReviewer, *noTester, *iterate, *maxIterations, *maxSubtasks, *outputDir, runLogDir, *ragURL, *ragCollection, *ragEmbedURL, *jinaKey, *noCoordinate, *guardrailRetries, *guardrailThreshold, *noSpecialists)
+		return cmdRunParallel(ctx, router, cfg, task, *supervisorRole, poolAliases, *noSynthesize, *noReviewer, *noTester, *iterate, *maxIterations, *maxSubtasks, *outputDir, runLogDir, *ragURL, *ragCollection, *ragEmbedURL, *jinaKey, *noCoordinate, *guardrailRetries, *guardrailThreshold, *noSpecialists, *ragAutoIngest)
 	}
 
 	// Legacy single-worker flow (no pool configured).
@@ -261,7 +310,7 @@ func cmdRun(args []string) error {
 //	0. RAG (optional)  0.5. Jina fetch (optional)  1. Decompose  2. Parallel workers
 //	2.5. Reviewer (optional)  3. Synthesize  4. Tester (optional)
 //	5. Build/fix loop (optional, requires --iterate)
-func cmdRunParallel(ctx context.Context, router *provider.Router, cfg *provider.Config, task, supervisorRole string, poolAliases []string, noSynthesize, noReviewer, noTester, iterate bool, maxIterations, maxSubtasks int, outputDir, runLogDir, ragURL, ragCollection, ragEmbedURL, jinaKey string, noCoordinate bool, guardrailRetries, guardrailThreshold int, noSpecialists bool) error {
+func cmdRunParallel(ctx context.Context, router *provider.Router, cfg *provider.Config, task, supervisorRole string, poolAliases []string, noSynthesize, noReviewer, noTester, iterate bool, maxIterations, maxSubtasks int, outputDir, runLogDir, ragURL, ragCollection, ragEmbedURL, jinaKey string, noCoordinate bool, guardrailRetries, guardrailThreshold int, noSpecialists, ragAutoIngest bool) error {
 	// Shared cost tracker for all roles in this run.
 	tracker := cost.NewTracker(cost.DefaultPricing())
 
@@ -288,6 +337,29 @@ func cmdRunParallel(ctx context.Context, router *provider.Router, cfg *provider.
 		mayorOpts = append(mayorOpts, role.WithMayorSpecialists(cfg.Specialists))
 	}
 	mayor := role.NewMayor(router, mayorOpts...)
+
+	// Phase -1: RAG auto-ingest (optional — only when --rag-auto-ingest and --rag-url are set).
+	if ragAutoIngest && ragURL != "" {
+		cwd, err := os.Getwd()
+		if err != nil {
+			return fmt.Errorf("getting working directory for auto-ingest: %w", err)
+		}
+		fmt.Printf("Phase -1: Auto-ingesting %s into RAG collection '%s'...\n", cwd, ragCollection)
+		ingestClient := rag.NewClient(ragURL, ragCollection)
+		if err := ingestClient.EnsureCollection(ctx, rag.DefaultEmbedVectorSize); err != nil {
+			fmt.Fprintf(os.Stderr, "  warning: RAG auto-ingest ensure collection failed: %v — continuing without ingest\n", err)
+		} else {
+			ingestEmbedder := rag.NewEmbedder(ragEmbedURL, rag.DefaultEmbedModel)
+			ingestor := rag.NewIngestor(ingestClient, ingestEmbedder)
+			total, ingestErr := ingestor.IngestDir(ctx, cwd)
+			if ingestErr != nil {
+				fmt.Fprintf(os.Stderr, "  warning: RAG auto-ingest failed: %v — continuing without ingest\n", ingestErr)
+			} else {
+				fmt.Printf("  Auto-ingested %d chunks\n", total)
+			}
+		}
+		fmt.Println()
+	}
 
 	// Phase 0: RAG context retrieval (optional — only when --rag-url is set).
 	ragContext := ""
