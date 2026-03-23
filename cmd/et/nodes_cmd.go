@@ -20,6 +20,14 @@ type ollamaTagsResponse struct {
 	} `json:"models"`
 }
 
+// openaiModelsResponse is the JSON payload from GET /v1/models (OpenAI-compatible).
+// Used by LM Studio and other OpenAI-compatible providers.
+type openaiModelsResponse struct {
+	Data []struct {
+		ID string `json:"id"`
+	} `json:"data"`
+}
+
 // cmdNodes implements "et nodes": pings each Ollama provider and lists models.
 func cmdNodes(args []string) error {
 	fs := flag.NewFlagSet("nodes", flag.ExitOnError)
@@ -84,6 +92,46 @@ func cmdNodes(args []string) error {
 		fmt.Printf("%-20s %-40s ✓ %s\n", name, baseURL, tags.Models[0].Name)
 		for _, m := range tags.Models[1:] {
 			fmt.Printf("%-20s %-40s   %s\n", "", "", m.Name)
+		}
+	}
+
+	// Show LM Studio instances.
+	for name, pc := range cfg.Providers {
+		if pc.Type != "lmstudio" {
+			continue
+		}
+		baseURL := pc.BaseURL
+		if baseURL == "" {
+			baseURL = "http://localhost:1234"
+		}
+
+		modelsURL := baseURL + "/v1/models"
+		resp, err := client.Get(modelsURL)
+		if err != nil {
+			fmt.Printf("%-20s %-40s ✗ offline (%v)\n", name, baseURL, trimErr(err))
+			continue
+		}
+		defer resp.Body.Close()
+
+		if resp.StatusCode != http.StatusOK {
+			fmt.Printf("%-20s %-40s ✗ HTTP %d\n", name, baseURL, resp.StatusCode)
+			continue
+		}
+
+		var models openaiModelsResponse
+		if err := json.NewDecoder(resp.Body).Decode(&models); err != nil {
+			fmt.Printf("%-20s %-40s ✗ parse error: %v\n", name, baseURL, err)
+			continue
+		}
+
+		if len(models.Data) == 0 {
+			fmt.Printf("%-20s %-40s ✓ online (no models loaded)\n", name, baseURL)
+			continue
+		}
+
+		fmt.Printf("%-20s %-40s ✓ %s\n", name, baseURL, models.Data[0].ID)
+		for _, m := range models.Data[1:] {
+			fmt.Printf("%-20s %-40s   %s\n", "", "", m.ID)
 		}
 	}
 
