@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"time"
 
+	"github.com/meganerd/electrictown/internal/agent"
 	"github.com/meganerd/electrictown/internal/provider"
 )
 
@@ -81,6 +82,39 @@ func cmdNodes(args []string) error {
 		fmt.Printf("%-20s %-40s ✓ %s\n", name, baseURL, tags.Models[0].Name)
 		for _, m := range tags.Models[1:] {
 			fmt.Printf("%-20s %-40s   %s\n", "", "", m.Name)
+		}
+	}
+
+	// Show agent status if any agents are configured.
+	if len(cfg.Agents) > 0 {
+		fmt.Printf("\n%-20s %-40s %s\n", "AGENT", "TYPE / TRANSPORT", "STATUS")
+		fmt.Printf("%-20s %-40s %s\n", "-----", "----------------", "------")
+
+		for name, ac := range cfg.Agents {
+			command := ac.Command
+			if command == "" {
+				command = agent.DefaultCommand(ac.Type)
+			}
+			typeInfo := fmt.Sprintf("%s / %s", ac.Type, ac.Transport)
+			if ac.Transport == "" {
+				typeInfo = fmt.Sprintf("%s / local", ac.Type)
+			}
+			if ac.Transport == "ssh" {
+				typeInfo = fmt.Sprintf("%s / ssh:%s", ac.Type, ac.Host)
+			}
+
+			if ac.Transport == "ssh" {
+				// SSH health checks deferred to SSH transport epic (ET-213).
+				fmt.Printf("%-20s %-40s ? ssh (check deferred)\n", name, typeInfo)
+				continue
+			}
+
+			status := agent.CheckLocal(name, command)
+			if status.Available {
+				fmt.Printf("%-20s %-40s ✓ %s\n", name, typeInfo, status.Detail)
+			} else {
+				fmt.Printf("%-20s %-40s ✗ %s\n", name, typeInfo, status.Detail)
+			}
 		}
 	}
 

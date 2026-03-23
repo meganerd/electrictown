@@ -27,6 +27,10 @@ type Config struct {
 	// Specialists defines domain-specific workers with dedicated models.
 	// The mayor assigns subtasks to specialists based on their descriptions.
 	Specialists map[string]SpecialistConfig `yaml:"specialists,omitempty"`
+
+	// Agents defines coding agent CLI backends (Claude Code, Codex, Aider, etc.).
+	// Agents are process-based tools, not LLM API providers.
+	Agents map[string]AgentConfig `yaml:"agents,omitempty"`
 }
 
 // AuthType constants for provider authentication methods.
@@ -51,9 +55,11 @@ type ModelConfig struct {
 	Model    string `yaml:"model"`    // actual model ID at the provider
 }
 
-// RoleConfig defines which model(s) a given agent role should use.
+// RoleConfig defines which model(s) or agent a given role should use.
+// A role targets either a model (LLM API) or an agent (CLI tool), never both.
 type RoleConfig struct {
-	Model     string   `yaml:"model"`               // primary model alias
+	Model     string   `yaml:"model,omitempty"`      // primary model alias (mutually exclusive with Agent)
+	Agent     string   `yaml:"agent,omitempty"`      // agent name from agents section (mutually exclusive with Model)
 	Pool      []string `yaml:"pool,omitempty"`       // parallel worker pool model aliases
 	Fallbacks []string `yaml:"fallbacks,omitempty"`  // fallback model aliases in order
 }
@@ -74,6 +80,33 @@ type SpecialistConfig struct {
 	Description string   `yaml:"description,omitempty"` // description for mayor context
 	Pool        []string `yaml:"pool,omitempty"`        // parallel pool model aliases
 	Fallbacks   []string `yaml:"fallbacks,omitempty"`   // fallback chain
+}
+
+// AgentConfig defines a coding agent CLI backend.
+type AgentConfig struct {
+	Type       string            `yaml:"type"`                  // agent type: claude-code, codex, aider, opencode, openclaw, gemini-cli
+	Transport  string            `yaml:"transport,omitempty"`   // "local" (default) or "ssh"
+	Host       string            `yaml:"host,omitempty"`        // SSH host (required when transport is "ssh")
+	Command    string            `yaml:"command,omitempty"`     // CLI binary path (default: auto-detect from type)
+	Model      string            `yaml:"model,omitempty"`       // model for the agent to use (mapped to --model flag)
+	Flags      []string          `yaml:"flags,omitempty"`       // additional CLI flags
+	WorkingDir string            `yaml:"working_dir,omitempty"` // working directory for the agent
+	Env        map[string]string `yaml:"env,omitempty"`         // environment variables for the agent process
+	Timeout    int               `yaml:"timeout,omitempty"`     // timeout in seconds (0 = default 30min)
+	SSHUser    string            `yaml:"ssh_user,omitempty"`    // SSH username (default: current user)
+	SSHKey     string            `yaml:"ssh_key,omitempty"`     // path to SSH private key
+	SSHPort    int               `yaml:"ssh_port,omitempty"`    // SSH port (default: 22)
+}
+
+// AgentTransport constants.
+const (
+	TransportLocal = "local"
+	TransportSSH   = "ssh"
+)
+
+// ValidAgentTypes lists recognized agent type strings.
+var ValidAgentTypes = []string{
+	"claude-code", "codex", "aider", "opencode", "openclaw", "gemini-cli",
 }
 
 // LoadConfig reads and parses an electrictown YAML config file.
@@ -127,6 +160,32 @@ func (c *Config) Validate() error {
 	}
 	// Validate role references.
 	for role, rc := range c.Roles {
+		// A role must have either a model or an agent, not both.
+		if rc.Model != "" && rc.Agent != "" {
+			return fmt.Errorf("config: role %q has both model and agent set (must be one or the other)", role)
+		}
+		if rc.Model == "" && rc.Agent == "" {
+			return fmt.Errorf("config: role %q has neither model nor agent set", role)
+		}
+		// Mayor role cannot target an agent (agents can't decompose tasks).
+		if rc.Agent != "" && role == "mayor" {
+			return fmt.Errorf("config: mayor role cannot target an agent (agents cannot decompose tasks)")
+		}
+		if rc.Agent != "" {
+			// Validate agent reference.
+			if _, ok := c.Agents[rc.Agent]; !ok {
+				return fmt.Errorf("config: role %q references unknown agent %q", role, rc.Agent)
+			}
+			// Agent roles should not have pool or fallbacks (not supported yet).
+			if len(rc.Pool) > 0 {
+				return fmt.Errorf("config: role %q targets an agent and cannot have a pool", role)
+			}
+			if len(rc.Fallbacks) > 0 {
+				return fmt.Errorf("config: role %q targets an agent and cannot have fallbacks", role)
+			}
+			continue
+		}
+		// Model-targeted role validation (existing logic).
 		if _, ok := c.Models[rc.Model]; !ok {
 			return fmt.Errorf("config: role %q references unknown model alias %q", role, rc.Model)
 		}
@@ -193,8 +252,55 @@ func (c *Config) Validate() error {
 			}
 		}
 	}
+	// Validate agent configs.
+	for name, ac := range c.Agents {
+		// Check for name conflicts with providers and built-in roles.
+		if _, ok := c.Providers[name]; ok {
+			return fmt.Errorf("config: agent %q conflicts with provider name", name)
+		}
+		if builtinRoles[name] {
+			return fmt.Errorf("config: agent %q conflicts with built-in role name", name)
+		}
+		// Validate agent type.
+		validType := false
+		for _, vt := range ValidAgentTypes {
+			if ac.Type == vt {
+				validType = true
+				break
+			}
+		}
+		if !validType {
+			return fmt.Errorf("config: agent %q has invalid type %q", name, ac.Type)
+		}
+		// Validate transport.
+		transport := ac.Transport
+		if transport == "" {
+			transport = TransportLocal
+		}
+		switch transport {
+		case TransportLocal, TransportSSH:
+			// valid
+		default:
+			return fmt.Errorf("config: agent %q has invalid transport %q (must be local or ssh)", name, transport)
+		}
+		// SSH transport requires a host.
+		if transport == TransportSSH && ac.Host == "" {
+			return fmt.Errorf("config: agent %q uses ssh transport but has no host set", name)
+		}
+		// Resolve env var references in agent env.
+		for k, v := range ac.Env {
+			if len(v) > 0 && v[0] == '$' {
+				resolved := os.Getenv(v[1:])
+				ac.Env[k] = resolved
+			}
+		}
+		c.Agents[name] = ac
+	}
 	// Detect pointless fallbacks (same provider+model as primary).
 	for role, rc := range c.Roles {
+		if rc.Agent != "" {
+			continue // agent-targeted roles don't have model fallbacks
+		}
 		primary, ok := c.Models[rc.Model]
 		if !ok {
 			continue // already caught above
@@ -233,8 +339,23 @@ func (c *Config) ResolveLogDir() (string, error) {
 	return dir, nil
 }
 
+// RoleTargetsAgent reports whether a role is configured to use a coding agent
+// backend instead of an LLM provider. Returns the agent name and config if so.
+func (c *Config) RoleTargetsAgent(role string) (string, *AgentConfig, bool) {
+	rc, ok := c.Roles[role]
+	if !ok || rc.Agent == "" {
+		return "", nil, false
+	}
+	ac, ok := c.Agents[rc.Agent]
+	if !ok {
+		return "", nil, false
+	}
+	return rc.Agent, &ac, true
+}
+
 // ResolveRole returns the provider config and model name for a given role.
 // Falls back to defaults if the role is not explicitly configured.
+// Returns an error if the role targets an agent (use RoleTargetsAgent instead).
 func (c *Config) ResolveRole(role string) (ProviderConfig, string, error) {
 	rc, ok := c.Roles[role]
 	if !ok {
@@ -242,6 +363,9 @@ func (c *Config) ResolveRole(role string) (ProviderConfig, string, error) {
 			return ProviderConfig{}, "", fmt.Errorf("config: role %q not configured and no default set", role)
 		}
 		rc = RoleConfig{Model: c.Defaults.Model, Fallbacks: c.Defaults.Fallbacks}
+	}
+	if rc.Agent != "" {
+		return ProviderConfig{}, "", fmt.Errorf("config: role %q targets agent %q, not a model (use RoleTargetsAgent)", role, rc.Agent)
 	}
 	return c.ResolveModel(rc.Model)
 }
