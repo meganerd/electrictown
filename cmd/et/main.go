@@ -207,6 +207,15 @@ func buildFactories() map[string]provider.ProviderFactory {
 			}
 			return gemini.New(pc.APIKey, opts...), nil
 		},
+		"lmstudio": func(pc provider.ProviderConfig) (provider.Provider, error) {
+			baseURL := pc.BaseURL
+			if baseURL == "" {
+				baseURL = "http://localhost:1234"
+			}
+			// LM Studio uses OpenAI-compatible API. Auth is optional
+			// (no auth required by default for local instances).
+			return openai.New(pc.APIKey, openai.WithBaseURL(baseURL)), nil
+		},
 	}
 }
 
