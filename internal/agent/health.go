@@ -48,6 +48,8 @@ func DefaultCommand(agentType string) string {
 		return "openclaw"
 	case "gemini-cli":
 		return "gemini"
+	case "cursor":
+		return "cursor"
 	default:
 		return agentType
 	}
