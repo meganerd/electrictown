@@ -75,6 +75,11 @@ func main() {
 			fmt.Fprintf(os.Stderr, "error: %v\n", err)
 			os.Exit(1)
 		}
+	case "loop":
+		if err := cmdLoop(os.Args[2:]); err != nil {
+			fmt.Fprintf(os.Stderr, "error: %s\n", err)
+			os.Exit(1)
+		}
 	case "version":
 		fmt.Printf("et %s\n", version)
 	case "--help", "-h", "help":
@@ -91,6 +96,7 @@ func printUsage() {
 
 Usage:
   et run [--config path] [--role name] "task description"
+  et loop [--config path] [--epic ET-XXX] [--max-iterations N]
   et session <spawn|list|attach|kill|send> [args]
   et rag     <ingest|query|stats> [flags] [args]
   et models  [--config path]
@@ -99,6 +105,7 @@ Usage:
 
 Commands:
   run      Execute supervisor→worker flow for a task
+  loop     Ralph Wiggum unattended task runner (reads from bd)
   session  Manage interactive agent sessions in tmux
   rag      Manage RAG knowledge base (ingest, query, stats)
   models   List all available models from configured providers
