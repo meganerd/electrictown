@@ -612,6 +612,313 @@ func TestSpecialistConfig_NoSpecialists(t *testing.T) {
 	}
 }
 
+// ═══════════════════════════════════════════════════════════════════
+// Agent config validation tests
+// ═══════════════════════════════════════════════════════════════════
+
+var testAgentConfigYAML = []byte(`
+providers:
+  ollama-local:
+    type: ollama
+    base_url: http://localhost:11434
+models:
+  qwen-local:
+    provider: ollama-local
+    model: qwen3-coder:32b
+roles:
+  mayor:
+    model: qwen-local
+  polecat:
+    agent: claude-dev
+defaults:
+  model: qwen-local
+agents:
+  claude-dev:
+    type: claude-code
+    transport: local
+    model: claude-sonnet-4-20250514
+  aider-remote:
+    type: aider
+    transport: ssh
+    host: devbox.local
+    model: gpt-4o
+    ssh_user: gustin
+`)
+
+func TestAgentConfigParsing(t *testing.T) {
+	cfg, err := ParseConfig(testAgentConfigYAML)
+	if err != nil {
+		t.Fatalf("ParseConfig failed: %v", err)
+	}
+	if len(cfg.Agents) != 2 {
+		t.Errorf("expected 2 agents, got %d", len(cfg.Agents))
+	}
+	claude := cfg.Agents["claude-dev"]
+	if claude.Type != "claude-code" {
+		t.Errorf("expected type claude-code, got %s", claude.Type)
+	}
+	if claude.Model != "claude-sonnet-4-20250514" {
+		t.Errorf("expected model claude-sonnet-4-20250514, got %s", claude.Model)
+	}
+	aider := cfg.Agents["aider-remote"]
+	if aider.Transport != "ssh" {
+		t.Errorf("expected transport ssh, got %s", aider.Transport)
+	}
+	if aider.Host != "devbox.local" {
+		t.Errorf("expected host devbox.local, got %s", aider.Host)
+	}
+}
+
+func TestAgentConfig_RoleTargetsAgent(t *testing.T) {
+	cfg, err := ParseConfig(testAgentConfigYAML)
+	if err != nil {
+		t.Fatalf("ParseConfig failed: %v", err)
+	}
+	name, ac, ok := cfg.RoleTargetsAgent("polecat")
+	if !ok {
+		t.Fatal("expected polecat to target an agent")
+	}
+	if name != "claude-dev" {
+		t.Errorf("expected agent name claude-dev, got %s", name)
+	}
+	if ac.Type != "claude-code" {
+		t.Errorf("expected type claude-code, got %s", ac.Type)
+	}
+
+	// Mayor should not target an agent.
+	_, _, ok = cfg.RoleTargetsAgent("mayor")
+	if ok {
+		t.Error("expected mayor to NOT target an agent")
+	}
+}
+
+func TestAgentConfig_ResolveRoleRejectsAgent(t *testing.T) {
+	cfg, err := ParseConfig(testAgentConfigYAML)
+	if err != nil {
+		t.Fatalf("ParseConfig failed: %v", err)
+	}
+	_, _, err = cfg.ResolveRole("polecat")
+	if err == nil {
+		t.Error("expected error when resolving agent-targeted role via ResolveRole")
+	}
+}
+
+func TestAgentConfig_InvalidType(t *testing.T) {
+	bad := []byte(`
+providers:
+  ollama:
+    type: ollama
+    base_url: http://localhost:11434
+models:
+  m:
+    provider: ollama
+    model: llama3
+roles: {}
+defaults:
+  model: m
+agents:
+  bad-agent:
+    type: nonexistent-type
+`)
+	_, err := ParseConfig(bad)
+	if err == nil {
+		t.Error("expected validation error for invalid agent type")
+	}
+}
+
+func TestAgentConfig_InvalidTransport(t *testing.T) {
+	bad := []byte(`
+providers:
+  ollama:
+    type: ollama
+    base_url: http://localhost:11434
+models:
+  m:
+    provider: ollama
+    model: llama3
+roles: {}
+defaults:
+  model: m
+agents:
+  bad-agent:
+    type: claude-code
+    transport: pigeon
+`)
+	_, err := ParseConfig(bad)
+	if err == nil {
+		t.Error("expected validation error for invalid transport")
+	}
+}
+
+func TestAgentConfig_SSHNoHost(t *testing.T) {
+	bad := []byte(`
+providers:
+  ollama:
+    type: ollama
+    base_url: http://localhost:11434
+models:
+  m:
+    provider: ollama
+    model: llama3
+roles: {}
+defaults:
+  model: m
+agents:
+  bad-agent:
+    type: aider
+    transport: ssh
+`)
+	_, err := ParseConfig(bad)
+	if err == nil {
+		t.Error("expected validation error for ssh transport without host")
+	}
+}
+
+func TestAgentConfig_NameConflictWithProvider(t *testing.T) {
+	bad := []byte(`
+providers:
+  ollama:
+    type: ollama
+    base_url: http://localhost:11434
+models:
+  m:
+    provider: ollama
+    model: llama3
+roles: {}
+defaults:
+  model: m
+agents:
+  ollama:
+    type: claude-code
+`)
+	_, err := ParseConfig(bad)
+	if err == nil {
+		t.Error("expected validation error for agent name conflicting with provider")
+	}
+}
+
+func TestAgentConfig_NameConflictWithBuiltinRole(t *testing.T) {
+	bad := []byte(`
+providers:
+  ollama:
+    type: ollama
+    base_url: http://localhost:11434
+models:
+  m:
+    provider: ollama
+    model: llama3
+roles: {}
+defaults:
+  model: m
+agents:
+  mayor:
+    type: claude-code
+`)
+	_, err := ParseConfig(bad)
+	if err == nil {
+		t.Error("expected validation error for agent name conflicting with built-in role")
+	}
+}
+
+func TestRoleConfig_BothModelAndAgent(t *testing.T) {
+	bad := []byte(`
+providers:
+  ollama:
+    type: ollama
+    base_url: http://localhost:11434
+models:
+  m:
+    provider: ollama
+    model: llama3
+roles:
+  polecat:
+    model: m
+    agent: some-agent
+defaults:
+  model: m
+agents:
+  some-agent:
+    type: claude-code
+`)
+	_, err := ParseConfig(bad)
+	if err == nil {
+		t.Error("expected validation error for role with both model and agent")
+	}
+}
+
+func TestRoleConfig_MayorTargetsAgent(t *testing.T) {
+	bad := []byte(`
+providers:
+  ollama:
+    type: ollama
+    base_url: http://localhost:11434
+models:
+  m:
+    provider: ollama
+    model: llama3
+roles:
+  mayor:
+    agent: some-agent
+defaults:
+  model: m
+agents:
+  some-agent:
+    type: claude-code
+`)
+	_, err := ParseConfig(bad)
+	if err == nil {
+		t.Error("expected validation error for mayor role targeting an agent")
+	}
+}
+
+func TestRoleConfig_AgentWithPool(t *testing.T) {
+	bad := []byte(`
+providers:
+  ollama:
+    type: ollama
+    base_url: http://localhost:11434
+models:
+  m:
+    provider: ollama
+    model: llama3
+roles:
+  polecat:
+    agent: some-agent
+    pool: [m]
+defaults:
+  model: m
+agents:
+  some-agent:
+    type: claude-code
+`)
+	_, err := ParseConfig(bad)
+	if err == nil {
+		t.Error("expected validation error for agent role with pool")
+	}
+}
+
+func TestRoleConfig_UnknownAgent(t *testing.T) {
+	bad := []byte(`
+providers:
+  ollama:
+    type: ollama
+    base_url: http://localhost:11434
+models:
+  m:
+    provider: ollama
+    model: llama3
+roles:
+  polecat:
+    agent: nonexistent-agent
+defaults:
+  model: m
+`)
+	_, err := ParseConfig(bad)
+	if err == nil {
+		t.Error("expected validation error for role referencing unknown agent")
+	}
+}
+
 func TestResolveRole_Default(t *testing.T) {
 	cfg, err := ParseConfig(testConfigYAML)
 	if err != nil {
