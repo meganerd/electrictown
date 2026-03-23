@@ -223,6 +223,27 @@ func buildFactories() map[string]provider.ProviderFactory {
 			// (no auth required by default for local instances).
 			return openai.New(pc.APIKey, openai.WithBaseURL(baseURL)), nil
 		},
+		"groq": func(pc provider.ProviderConfig) (provider.Provider, error) {
+			baseURL := pc.BaseURL
+			if baseURL == "" {
+				baseURL = "https://api.groq.com/openai/v1"
+			}
+			return openai.New(pc.APIKey, openai.WithBaseURL(baseURL)), nil
+		},
+		"mistral": func(pc provider.ProviderConfig) (provider.Provider, error) {
+			baseURL := pc.BaseURL
+			if baseURL == "" {
+				baseURL = "https://api.mistral.ai/v1"
+			}
+			return openai.New(pc.APIKey, openai.WithBaseURL(baseURL)), nil
+		},
+		"cerebras": func(pc provider.ProviderConfig) (provider.Provider, error) {
+			baseURL := pc.BaseURL
+			if baseURL == "" {
+				baseURL = "https://api.cerebras.ai/v1"
+			}
+			return openai.New(pc.APIKey, openai.WithBaseURL(baseURL)), nil
+		},
 	}
 }
 
