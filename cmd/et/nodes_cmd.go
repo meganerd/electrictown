@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/meganerd/electrictown/internal/agent"
+	"github.com/meganerd/electrictown/internal/agent/transport"
 	"github.com/meganerd/electrictown/internal/provider"
 )
 
@@ -23,6 +24,7 @@ type ollamaTagsResponse struct {
 func cmdNodes(args []string) error {
 	fs := flag.NewFlagSet("nodes", flag.ExitOnError)
 	configPath := fs.String("config", "", "path to config file (default: ./electrictown.yaml, then $HOME/electrictown.yaml)")
+	discover := fs.Bool("discover", false, "discover coding agent CLIs on SSH-configured agent hosts")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -104,8 +106,45 @@ func cmdNodes(args []string) error {
 			}
 
 			if ac.Transport == "ssh" {
-				// SSH health checks deferred to SSH transport epic (ET-213).
-				fmt.Printf("%-20s %-40s ? ssh (check deferred)\n", name, typeInfo)
+				if !*discover {
+					fmt.Printf("%-20s %-40s ? ssh (use --discover to check)\n", name, typeInfo)
+					continue
+				}
+				// SSH discovery: connect and check for binary.
+				mgr := transport.NewSSHManager()
+				authCfg := transport.AuthConfig{
+					User:    ac.SSHUser,
+					Port:    ac.SSHPort,
+					KeyPath: ac.SSHKey,
+				}
+				client, err := mgr.GetConnection(ac.Host, ac.SSHPort, authCfg)
+				if err != nil {
+					fmt.Printf("%-20s %-40s ✗ ssh connect failed: %s\n", name, typeInfo, trimErr(err))
+					mgr.Close()
+					continue
+				}
+				agents, err := transport.DiscoverAgents(client, mgr)
+				mgr.Close()
+				if err != nil {
+					fmt.Printf("%-20s %-40s ✗ discovery failed: %s\n", name, typeInfo, trimErr(err))
+					continue
+				}
+				// Find the matching agent type.
+				found := false
+				for _, da := range agents {
+					if da.Type == ac.Type {
+						if da.Found {
+							fmt.Printf("%-20s %-40s ✓ %s\n", name, typeInfo, da.Version)
+						} else {
+							fmt.Printf("%-20s %-40s ✗ binary not found on remote\n", name, typeInfo)
+						}
+						found = true
+						break
+					}
+				}
+				if !found {
+					fmt.Printf("%-20s %-40s ? unknown agent type\n", name, typeInfo)
+				}
 				continue
 			}
 
