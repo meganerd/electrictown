@@ -19,6 +19,7 @@ const (
 	TypeOpenCode   AgentType = "opencode"
 	TypeOpenClaw   AgentType = "openclaw"
 	TypeGeminiCLI  AgentType = "gemini-cli"
+	TypeCursor     AgentType = "cursor"
 )
 
 // ValidAgentTypes returns all recognized agent type strings.
@@ -26,6 +27,7 @@ func ValidAgentTypes() []AgentType {
 	return []AgentType{
 		TypeClaudeCode, TypeCodex, TypeAider,
 		TypeOpenCode, TypeOpenClaw, TypeGeminiCLI,
+		TypeCursor,
 	}
 }
 
