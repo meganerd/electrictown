@@ -289,7 +289,7 @@ func cmdRun(args []string) error {
 	}
 
 	task := strings.Join(fs.Args(), " ")
-	if task == "" {
+	if task == "" && !*useTUI {
 		return fmt.Errorf("task description required\n\nUsage: et run [--config path] [--role name] \"task description\"")
 	}
 
@@ -334,24 +334,56 @@ func cmdRun(args []string) error {
 	defer bus.Close()
 
 	if *useTUI {
-		// TUI mode: Bubble Tea subscriber with alt-screen.
+		// Build config summary for TUI display.
+		poolAliases := cfg.PoolForRole(workerRole)
+		configInfo := fmt.Sprintf("Pool: %d workers, role: %s", len(poolAliases), *supervisorRole)
+
 		tuiSub := bus.Subscribe()
-		// Emit the task-started event before launching TUI.
+
+		if task == "" {
+			// Interactive mode: TUI collects the task from the user.
+			errCh := make(chan error, 1)
+			submittedTask, tuiErr := tui.RunInteractive(tuiSub, resolvedConfig, configInfo, version, func(submitted string) {
+				// Callback fires when user submits task in TUI.
+				bus.Emit(event.TaskStarted, event.TaskStartedData{
+					Task:       submitted,
+					ConfigPath: resolvedConfig,
+					LogDir:     runLogDir,
+					Version:    version,
+				})
+				if len(poolAliases) > 0 {
+					go func() {
+						errCh <- cmdRunParallel(ctx, router, cfg, submitted, *supervisorRole, poolAliases, *noSynthesize, *noReviewer, *noTester, *iterate, *maxIterations, *maxSubtasks, *outputDir, runLogDir, *ragURL, *ragCollection, *ragEmbedURL, *jinaKey, *noCoordinate, *guardrailRetries, *guardrailThreshold, *noSpecialists, *ragAutoIngest, bus)
+					}()
+				}
+			})
+			if tuiErr != nil {
+				return fmt.Errorf("TUI error: %w", tuiErr)
+			}
+			if submittedTask == "" {
+				return nil // User cancelled.
+			}
+			select {
+			case err := <-errCh:
+				return err
+			default:
+				return nil
+			}
+		}
+
+		// Task provided on CLI: skip input, go straight to execution.
 		bus.Emit(event.TaskStarted, event.TaskStartedData{
 			Task:       task,
 			ConfigPath: resolvedConfig,
 			LogDir:     runLogDir,
 			Version:    version,
 		})
-		// Check if the worker role has a pool configured.
-		poolAliases := cfg.PoolForRole(workerRole)
 		if len(poolAliases) > 0 {
-			// Launch orchestration in a goroutine, TUI blocks the main thread.
 			errCh := make(chan error, 1)
 			go func() {
 				errCh <- cmdRunParallel(ctx, router, cfg, task, *supervisorRole, poolAliases, *noSynthesize, *noReviewer, *noTester, *iterate, *maxIterations, *maxSubtasks, *outputDir, runLogDir, *ragURL, *ragCollection, *ragEmbedURL, *jinaKey, *noCoordinate, *guardrailRetries, *guardrailThreshold, *noSpecialists, *ragAutoIngest, bus)
 			}()
-			if tuiErr := tui.Run(tuiSub); tuiErr != nil {
+			if tuiErr := tui.Run(tuiSub, task, resolvedConfig, configInfo, version); tuiErr != nil {
 				return fmt.Errorf("TUI error: %w", tuiErr)
 			}
 			return <-errCh

@@ -8,6 +8,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/charmbracelet/bubbles/textarea"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 
@@ -24,6 +25,10 @@ var styles = struct {
 	muted     lipgloss.Style
 	footer    lipgloss.Style
 	separator lipgloss.Style
+	helpKey   lipgloss.Style
+	helpDesc  lipgloss.Style
+	inputBox  lipgloss.Style
+	timeline  lipgloss.Style
 }{
 	header:    lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("39")),
 	phase:     lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("213")),
@@ -33,7 +38,19 @@ var styles = struct {
 	muted:     lipgloss.NewStyle().Foreground(lipgloss.Color("245")),
 	footer:    lipgloss.NewStyle().Foreground(lipgloss.Color("39")),
 	separator: lipgloss.NewStyle().Foreground(lipgloss.Color("240")),
+	helpKey:   lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("39")),
+	helpDesc:  lipgloss.NewStyle().Foreground(lipgloss.Color("245")),
+	inputBox:  lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).BorderForeground(lipgloss.Color("39")).Padding(0, 1),
+	timeline:  lipgloss.NewStyle().Foreground(lipgloss.Color("245")),
 }
+
+// viewMode tracks which view the TUI is showing.
+type viewMode int
+
+const (
+	modeInput     viewMode = iota // Waiting for user to type task.
+	modeExecution                 // Task running, showing progress.
+)
 
 // eventMsg wraps an event.Event for the Bubble Tea message loop.
 type eventMsg event.Event
@@ -41,19 +58,30 @@ type eventMsg event.Event
 // tickMsg triggers periodic UI refresh.
 type tickMsg time.Time
 
+// taskSubmittedMsg is sent when the user submits a task from the input view.
+type taskSubmittedMsg string
+
+// maxLogLines caps the log pane size to prevent unbounded memory growth.
+const maxLogLines = 100
+
 // Model is the Bubble Tea model for the electrictown TUI.
 type Model struct {
 	// Configuration.
 	sub    event.Subscriber
 	width  int
 	height int
+	mode   viewMode
+
+	// Input state.
+	textarea   textarea.Model
+	configPath string
+	configInfo string // summary of config (models, pool size, etc.)
 
 	// Run state.
-	version    string
-	task       string
-	configPath string
-	logDir     string
-	startTime  time.Time
+	version   string
+	task      string
+	logDir    string
+	startTime time.Time
 
 	// Phase tracking.
 	currentPhase string
@@ -70,9 +98,15 @@ type Model struct {
 	totalTokens int
 	cost        float64
 
+	// Log pane.
+	logLines []string
+
 	// Completion.
 	done     bool
 	duration time.Duration
+
+	// Task submission callback (set by RunInteractive).
+	onSubmit func(string)
 }
 
 type phaseRecord struct {
@@ -100,17 +134,39 @@ type workerState struct {
 }
 
 // New creates a TUI model that reads from the given event subscriber.
-func New(sub event.Subscriber) Model {
+// If task is empty, the TUI starts in input mode.
+func New(sub event.Subscriber, task, configPath, configInfo, ver string) Model {
+	ta := textarea.New()
+	ta.Placeholder = "Describe the task for electrictown workers..."
+	ta.CharLimit = 4096
+	ta.SetWidth(60)
+	ta.SetHeight(3)
+	ta.Focus()
+
+	mode := modeExecution
+	if task == "" {
+		mode = modeInput
+	}
+
 	return Model{
-		sub:       sub,
-		startTime: time.Now(),
-		width:     80,
-		height:    24,
+		sub:        sub,
+		startTime:  time.Now(),
+		width:      80,
+		height:     24,
+		mode:       mode,
+		textarea:   ta,
+		task:       task,
+		configPath: configPath,
+		configInfo: configInfo,
+		version:    ver,
 	}
 }
 
 // Init starts the event listener and tick timer.
 func (m Model) Init() tea.Cmd {
+	if m.mode == modeInput {
+		return tea.Batch(textarea.Blink, m.tick())
+	}
 	return tea.Batch(
 		m.listenForEvents(),
 		m.tick(),
@@ -121,14 +177,15 @@ func (m Model) Init() tea.Cmd {
 func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case tea.KeyMsg:
-		switch msg.String() {
-		case "q", "ctrl+c":
-			return m, tea.Quit
+		if m.mode == modeInput {
+			return m.updateInput(msg)
 		}
+		return m.updateExecution(msg)
 
 	case tea.WindowSizeMsg:
 		m.width = msg.Width
 		m.height = msg.Height
+		m.textarea.SetWidth(min(m.width-6, 80))
 
 	case tickMsg:
 		if m.done {
@@ -139,24 +196,107 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case eventMsg:
 		e := event.Event(msg)
 		m.handleEvent(e)
+		m.appendLog(e)
 		if m.done {
-			return m, tea.Quit
+			// Let user see final state before quitting.
+			return m, nil
 		}
 		return m, m.listenForEvents()
+
+	case taskSubmittedMsg:
+		m.task = string(msg)
+		m.mode = modeExecution
+		m.startTime = time.Now()
+		if m.onSubmit != nil {
+			m.onSubmit(m.task)
+		}
+		return m, m.listenForEvents()
+	}
+
+	// Forward to textarea in input mode.
+	if m.mode == modeInput {
+		var cmd tea.Cmd
+		m.textarea, cmd = m.textarea.Update(msg)
+		return m, cmd
 	}
 
 	return m, nil
 }
 
+func (m Model) updateInput(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch msg.Type {
+	case tea.KeyCtrlC, tea.KeyEsc:
+		return m, tea.Quit
+	case tea.KeyEnter:
+		task := strings.TrimSpace(m.textarea.Value())
+		if task == "" {
+			return m, nil // Don't submit empty task.
+		}
+		return m, func() tea.Msg { return taskSubmittedMsg(task) }
+	}
+	var cmd tea.Cmd
+	m.textarea, cmd = m.textarea.Update(msg)
+	return m, cmd
+}
+
+func (m Model) updateExecution(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch msg.String() {
+	case "q", "ctrl+c":
+		return m, tea.Quit
+	}
+	return m, nil
+}
+
 // View renders the TUI.
 func (m Model) View() string {
+	if m.mode == modeInput {
+		return m.viewInput()
+	}
+	return m.viewExecution()
+}
+
+func (m Model) viewInput() string {
+	var b strings.Builder
+
+	// Header.
+	b.WriteString(styles.header.Render(fmt.Sprintf("⚡ electrictown %s", m.version)))
+	b.WriteString("\n")
+	b.WriteString(styles.separator.Render(strings.Repeat("─", min(m.width, 60))))
+	b.WriteString("\n\n")
+
+	// Config info.
+	b.WriteString(styles.muted.Render(fmt.Sprintf("  Config: %s", m.configPath)))
+	b.WriteString("\n")
+	if m.configInfo != "" {
+		b.WriteString(styles.muted.Render(fmt.Sprintf("  %s", m.configInfo)))
+		b.WriteString("\n")
+	}
+	b.WriteString("\n")
+
+	// Task input prompt.
+	b.WriteString("  " + styles.phase.Render("Task:") + "\n")
+	b.WriteString(styles.inputBox.Render(m.textarea.View()))
+	b.WriteString("\n\n")
+
+	// Help bar.
+	b.WriteString(m.renderHelpBar())
+
+	return b.String()
+}
+
+func (m Model) viewExecution() string {
 	var b strings.Builder
 
 	// Header zone.
 	b.WriteString(m.renderHeader())
 	b.WriteString("\n")
 
-	// Phase zone.
+	// Phase timeline (completed phases).
+	if len(m.phases) > 0 {
+		b.WriteString(m.renderTimeline())
+	}
+
+	// Active phase.
 	if m.currentPhase != "" {
 		b.WriteString(styles.phase.Render("▶ "+m.currentPhase) + "\n")
 	}
@@ -173,8 +313,16 @@ func (m Model) View() string {
 		b.WriteString("\n")
 	}
 
-	// Footer zone (cost + time).
+	// Log pane.
+	if len(m.logLines) > 0 {
+		b.WriteString(m.renderLogPane())
+		b.WriteString("\n")
+	}
+
+	// Footer zone (cost + time + help).
 	b.WriteString(m.renderFooter())
+	b.WriteString("\n")
+	b.WriteString(m.renderHelpBar())
 
 	return b.String()
 }
@@ -200,6 +348,7 @@ func (m *Model) handleEvent(e event.Event) {
 	case event.PhaseCompleted:
 		if d, ok := e.Data.(event.PhaseData); ok {
 			m.phases = append(m.phases, phaseRecord{name: d.Name, duration: d.Duration})
+			m.currentPhase = ""
 		}
 
 	case event.SubtaskDecomposed:
@@ -281,6 +430,69 @@ func (m *Model) handleEvent(e event.Event) {
 	}
 }
 
+func (m *Model) appendLog(e event.Event) {
+	line := formatLogLine(e)
+	if line == "" {
+		return
+	}
+	m.logLines = append(m.logLines, line)
+	if len(m.logLines) > maxLogLines {
+		m.logLines = m.logLines[len(m.logLines)-maxLogLines:]
+	}
+}
+
+func formatLogLine(e event.Event) string {
+	ts := e.Timestamp.Format("15:04:05")
+	switch e.Type {
+	case event.PhaseStarted:
+		if d, ok := e.Data.(event.PhaseData); ok {
+			return fmt.Sprintf("[%s] %s", ts, d.Name)
+		}
+	case event.SubtaskDecomposed:
+		if d, ok := e.Data.(event.SubtaskDecomposedData); ok {
+			return fmt.Sprintf("[%s] Decomposed into %d subtasks", ts, len(d.Subtasks))
+		}
+	case event.WorkerCompleted:
+		if d, ok := e.Data.(event.WorkerData); ok {
+			return fmt.Sprintf("[%s] Worker %d done (%d tok, %.1fs)", ts, d.Index+1, d.Tokens, d.Duration.Seconds())
+		}
+	case event.WorkerFailed:
+		if d, ok := e.Data.(event.WorkerData); ok {
+			return fmt.Sprintf("[%s] Worker %d FAILED: %s", ts, d.Index+1, d.Error)
+		}
+	case event.GuardrailRetry:
+		if d, ok := e.Data.(event.GuardrailRetryData); ok {
+			return fmt.Sprintf("[%s] Guardrail retry worker %d (attempt %d/%d, score %d)", ts, d.Index+1, d.Attempt, d.MaxRetries, d.Score)
+		}
+	case event.RAGIngest:
+		if d, ok := e.Data.(event.RAGData); ok {
+			return fmt.Sprintf("[%s] RAG ingested %d chunks", ts, d.Count)
+		}
+	case event.RAGQuery:
+		if d, ok := e.Data.(event.RAGData); ok {
+			return fmt.Sprintf("[%s] RAG retrieved %d chunks", ts, d.Count)
+		}
+	case event.JinaFetch:
+		if d, ok := e.Data.(event.JinaFetchData); ok {
+			if d.Error != "" {
+				return fmt.Sprintf("[%s] Jina fetch failed: %s — %s", ts, d.URL, d.Error)
+			}
+			return fmt.Sprintf("[%s] Fetched %s (%d chars)", ts, d.URL, d.Length)
+		}
+	case event.ValidationResult:
+		if d, ok := e.Data.(event.ValidationData); ok {
+			if !d.Passed {
+				return fmt.Sprintf("[%s] Validation failed worker %d", ts, d.Index+1)
+			}
+		}
+	case event.RunCompleted:
+		if d, ok := e.Data.(event.RunCompletedData); ok {
+			return fmt.Sprintf("[%s] Run completed in %s", ts, d.Duration.Round(time.Millisecond))
+		}
+	}
+	return ""
+}
+
 func (m *Model) ensureWorker(idx, total int) {
 	needed := idx + 1
 	if total > needed {
@@ -301,6 +513,23 @@ func (m Model) renderHeader() string {
 	sep := styles.separator.Render(strings.Repeat("─", min(m.width, 60)))
 	task := styles.muted.Render(truncate(m.task, m.width-4))
 	return fmt.Sprintf("%s\n%s\n%s", title, sep, task)
+}
+
+func (m Model) renderTimeline() string {
+	var parts []string
+	for _, p := range m.phases {
+		dur := ""
+		if p.duration > 0 {
+			dur = fmt.Sprintf(" (%s)", p.duration.Round(time.Millisecond))
+		}
+		// Shorten phase name for timeline (strip "Phase X: " detail).
+		name := p.name
+		if idx := strings.Index(name, ":"); idx > 0 && idx < 12 {
+			name = name[:idx]
+		}
+		parts = append(parts, styles.success.Render("✓")+styles.timeline.Render(name+dur))
+	}
+	return strings.Join(parts, styles.separator.Render(" → ")) + "\n"
 }
 
 func (m Model) renderDAG() string {
@@ -377,6 +606,23 @@ func (m Model) renderWorkers() string {
 	return b.String()
 }
 
+func (m Model) renderLogPane() string {
+	var b strings.Builder
+	b.WriteString(styles.separator.Render("── Log ") + styles.separator.Render(strings.Repeat("─", max(0, m.width-9))) + "\n")
+
+	// Show last N lines that fit in available space.
+	maxLines := 6
+	start := len(m.logLines) - maxLines
+	if start < 0 {
+		start = 0
+	}
+	for _, line := range m.logLines[start:] {
+		b.WriteString(" " + styles.muted.Render(truncate(line, m.width-3)) + "\n")
+	}
+
+	return b.String()
+}
+
 func (m Model) renderFooter() string {
 	sep := styles.separator.Render(strings.Repeat("─", min(m.width, 60)))
 	elapsed := time.Since(m.startTime).Round(time.Second)
@@ -391,6 +637,21 @@ func (m Model) renderFooter() string {
 	}
 
 	return fmt.Sprintf("%s\n%s%s%s", sep, left, strings.Repeat(" ", gap), right)
+}
+
+func (m Model) renderHelpBar() string {
+	if m.mode == modeInput {
+		return styles.helpKey.Render("enter") + styles.helpDesc.Render(" submit") +
+			styles.muted.Render(" · ") +
+			styles.helpKey.Render("esc") + styles.helpDesc.Render(" quit")
+	}
+	help := styles.helpKey.Render("q") + styles.helpDesc.Render(" quit")
+	if m.done {
+		help = styles.helpKey.Render("q") + styles.helpDesc.Render(" exit") +
+			styles.muted.Render(" · ") +
+			styles.success.Render("✓ run complete")
+	}
+	return help
 }
 
 // --- Helpers ---
@@ -467,10 +728,27 @@ func (m Model) tick() tea.Cmd {
 	})
 }
 
-// Run starts the TUI, blocking until completion. This is the main entry
-// point called from cmd/et/main.go when --tui is set.
-func Run(sub event.Subscriber) error {
-	p := tea.NewProgram(New(sub), tea.WithAltScreen())
+// Run starts the TUI in execution mode (task already known), blocking until
+// completion. Called from cmd/et/main.go when --tui is set with a task arg.
+func Run(sub event.Subscriber, task, configPath, configInfo, ver string) error {
+	p := tea.NewProgram(New(sub, task, configPath, configInfo, ver), tea.WithAltScreen())
 	_, err := p.Run()
 	return err
+}
+
+// RunInteractive starts the TUI in input mode (no task yet). The user types a
+// task, then onSubmit is called with the task text. The caller should start
+// orchestration in the callback. Returns the submitted task or empty if cancelled.
+func RunInteractive(sub event.Subscriber, configPath, configInfo, ver string, onSubmit func(string)) (string, error) {
+	m := New(sub, "", configPath, configInfo, ver)
+	m.onSubmit = onSubmit
+	p := tea.NewProgram(m, tea.WithAltScreen())
+	finalModel, err := p.Run()
+	if err != nil {
+		return "", err
+	}
+	if fm, ok := finalModel.(Model); ok {
+		return fm.task, nil
+	}
+	return "", nil
 }
