@@ -50,6 +50,8 @@ func DefaultCommand(agentType string) string {
 		return "gemini"
 	case "cursor":
 		return "cursor"
+	case "skill":
+		return "" // skill type requires explicit command in config
 	default:
 		return agentType
 	}

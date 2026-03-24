@@ -84,7 +84,7 @@ type SpecialistConfig struct {
 
 // AgentConfig defines a coding agent CLI backend.
 type AgentConfig struct {
-	Type       string            `yaml:"type"`                  // agent type: claude-code, codex, aider, opencode, openclaw, gemini-cli
+	Type       string            `yaml:"type"`                  // agent type: claude-code, codex, aider, opencode, openclaw, gemini-cli, skill
 	Transport  string            `yaml:"transport,omitempty"`   // "local" (default) or "ssh"
 	Host       string            `yaml:"host,omitempty"`        // SSH host (required when transport is "ssh")
 	Command    string            `yaml:"command,omitempty"`     // CLI binary path (default: auto-detect from type)
@@ -96,6 +96,8 @@ type AgentConfig struct {
 	SSHUser    string            `yaml:"ssh_user,omitempty"`    // SSH username (default: current user)
 	SSHKey     string            `yaml:"ssh_key,omitempty"`     // path to SSH private key
 	SSHPort    int               `yaml:"ssh_port,omitempty"`    // SSH port (default: 22)
+	SkillPath  string            `yaml:"skill_path,omitempty"`  // path to skill script (type: skill only)
+	InputMode  string            `yaml:"input_mode,omitempty"`  // how to deliver task: "arg" (default) or "stdin" (type: skill only)
 }
 
 // AgentTransport constants.
@@ -106,7 +108,7 @@ const (
 
 // ValidAgentTypes lists recognized agent type strings.
 var ValidAgentTypes = []string{
-	"claude-code", "codex", "aider", "opencode", "openclaw", "gemini-cli", "cursor",
+	"claude-code", "codex", "aider", "opencode", "openclaw", "gemini-cli", "cursor", "skill",
 }
 
 // LoadConfig reads and parses an electrictown YAML config file.
@@ -286,6 +288,14 @@ func (c *Config) Validate() error {
 		// SSH transport requires a host.
 		if transport == TransportSSH && ac.Host == "" {
 			return fmt.Errorf("config: agent %q uses ssh transport but has no host set", name)
+		}
+		// Skill type requires a command.
+		if ac.Type == "skill" && ac.Command == "" {
+			return fmt.Errorf("config: skill agent %q requires a command (e.g., bun, node, python, or the skill binary)", name)
+		}
+		// Validate input_mode if set.
+		if ac.InputMode != "" && ac.InputMode != "arg" && ac.InputMode != "stdin" {
+			return fmt.Errorf("config: agent %q has invalid input_mode %q (must be arg or stdin)", name, ac.InputMode)
 		}
 		// Resolve env var references in agent env.
 		for k, v := range ac.Env {

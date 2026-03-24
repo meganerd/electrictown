@@ -6,14 +6,14 @@ import (
 
 func TestAgentTypeConstants(t *testing.T) {
 	types := ValidAgentTypes()
-	if len(types) != 7 {
-		t.Errorf("expected 7 agent types, got %d", len(types))
+	if len(types) != 8 {
+		t.Errorf("expected 8 agent types, got %d", len(types))
 	}
 	// Verify all expected types are present.
 	expected := []AgentType{
 		TypeClaudeCode, TypeCodex, TypeAider,
 		TypeOpenCode, TypeOpenClaw, TypeGeminiCLI,
-		TypeCursor,
+		TypeCursor, TypeSkill,
 	}
 	for _, e := range expected {
 		if !IsValidAgentType(e) {
