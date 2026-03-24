@@ -169,10 +169,8 @@ func (c *Config) Validate() error {
 		if rc.Model == "" && rc.Agent == "" {
 			return fmt.Errorf("config: role %q has neither model nor agent set", role)
 		}
-		// Mayor role cannot target an agent (agents can't decompose tasks).
-		if rc.Agent != "" && role == "mayor" {
-			return fmt.Errorf("config: mayor role cannot target an agent (agents cannot decompose tasks)")
-		}
+		// Mayor role can now target agents (skills, Claude Code, etc.) — the Mayor
+		// struct dispatches through agent.Backend when configured.
 		if rc.Agent != "" {
 			// Validate agent reference.
 			if _, ok := c.Agents[rc.Agent]; !ok {

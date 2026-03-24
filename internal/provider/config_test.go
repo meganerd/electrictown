@@ -847,7 +847,8 @@ agents:
 }
 
 func TestRoleConfig_MayorTargetsAgent(t *testing.T) {
-	bad := []byte(`
+	// Mayor targeting an agent is now valid — agents can serve as mayors.
+	good := []byte(`
 providers:
   ollama:
     type: ollama
@@ -865,9 +866,9 @@ agents:
   some-agent:
     type: claude-code
 `)
-	_, err := ParseConfig(bad)
-	if err == nil {
-		t.Error("expected validation error for mayor role targeting an agent")
+	_, err := ParseConfig(good)
+	if err != nil {
+		t.Errorf("mayor targeting an agent should be valid, got: %v", err)
 	}
 }
 
