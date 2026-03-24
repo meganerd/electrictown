@@ -27,6 +27,7 @@ import (
 	"github.com/meganerd/electrictown/internal/cache"
 	"github.com/meganerd/electrictown/internal/cost"
 	"github.com/meganerd/electrictown/internal/decision"
+	"github.com/meganerd/electrictown/internal/event"
 	"github.com/meganerd/electrictown/internal/fileutil"
 	"github.com/meganerd/electrictown/internal/jina"
 	"github.com/meganerd/electrictown/internal/pool"
@@ -37,6 +38,7 @@ import (
 	"github.com/meganerd/electrictown/internal/provider/openai"
 	"github.com/meganerd/electrictown/internal/rag"
 	"github.com/meganerd/electrictown/internal/role"
+	"github.com/meganerd/electrictown/internal/tui"
 	"github.com/meganerd/electrictown/internal/validate"
 )
 
@@ -133,6 +135,7 @@ Flags (run):
   --guardrail-threshold Minimum reviewer score (1-10) before triggering retry (default: 6)
   --no-specialists      Disable specialist routing (ignore specialists config)
   --env-file            Path to KEY=VALUE file to load into environment before execution
+  --tui                 Enable terminal UI (Bubble Tea) instead of headless output
 
 Flags (models, nodes):
   --config   Path to config file (default: ./electrictown.yaml, then $HOME/electrictown.yaml)
@@ -273,6 +276,7 @@ func cmdRun(args []string) error {
 	noSpecialists := fs.Bool("no-specialists", false, "disable specialist routing (ignore specialists config)")
 	ragAutoIngest := fs.Bool("rag-auto-ingest", false, "auto-ingest current working directory into RAG before run (requires --rag-url)")
 	envFile := fs.String("env-file", "", "path to file of KEY=VALUE pairs to load into environment")
+	useTUI := fs.Bool("tui", false, "enable terminal UI (Bubble Tea) instead of headless output")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -325,17 +329,51 @@ func cmdRun(args []string) error {
 		fmt.Fprintf(os.Stderr, "  warning: cannot create log directory %s: %s — continuing without logs\n", runLogDir, classifyFSError(err))
 	}
 
-	fmt.Printf("electrictown %s\n", version)
-	fmt.Printf("============\n")
-	fmt.Printf("Config: %s\n", resolvedConfig)
-	fmt.Printf("Task:   %s\n", task)
-	fmt.Printf("Logs:   %s\n", runLogDir)
-	fmt.Printf("Start:  %s\n\n", time.Now().Format("15:04:05"))
+	// Create event bus and register subscriber.
+	bus := event.NewBus()
+	defer bus.Close()
+
+	if *useTUI {
+		// TUI mode: Bubble Tea subscriber with alt-screen.
+		tuiSub := bus.Subscribe()
+		// Emit the task-started event before launching TUI.
+		bus.Emit(event.TaskStarted, event.TaskStartedData{
+			Task:       task,
+			ConfigPath: resolvedConfig,
+			LogDir:     runLogDir,
+			Version:    version,
+		})
+		// Check if the worker role has a pool configured.
+		poolAliases := cfg.PoolForRole(workerRole)
+		if len(poolAliases) > 0 {
+			// Launch orchestration in a goroutine, TUI blocks the main thread.
+			errCh := make(chan error, 1)
+			go func() {
+				errCh <- cmdRunParallel(ctx, router, cfg, task, *supervisorRole, poolAliases, *noSynthesize, *noReviewer, *noTester, *iterate, *maxIterations, *maxSubtasks, *outputDir, runLogDir, *ragURL, *ragCollection, *ragEmbedURL, *jinaKey, *noCoordinate, *guardrailRetries, *guardrailThreshold, *noSpecialists, *ragAutoIngest, bus)
+			}()
+			if tuiErr := tui.Run(tuiSub); tuiErr != nil {
+				return fmt.Errorf("TUI error: %w", tuiErr)
+			}
+			return <-errCh
+		}
+		return cmdRunSingle(ctx, router, task, *supervisorRole, workerRole, *outputDir, runLogDir)
+	}
+
+	// Headless mode: CLI subscriber (default).
+	cliSub := bus.Subscribe()
+	go event.NewCLISubscriber(nil, nil).Run(cliSub)
+
+	bus.Emit(event.TaskStarted, event.TaskStartedData{
+		Task:       task,
+		ConfigPath: resolvedConfig,
+		LogDir:     runLogDir,
+		Version:    version,
+	})
 
 	// Check if the worker role has a pool configured.
 	poolAliases := cfg.PoolForRole(workerRole)
 	if len(poolAliases) > 0 {
-		return cmdRunParallel(ctx, router, cfg, task, *supervisorRole, poolAliases, *noSynthesize, *noReviewer, *noTester, *iterate, *maxIterations, *maxSubtasks, *outputDir, runLogDir, *ragURL, *ragCollection, *ragEmbedURL, *jinaKey, *noCoordinate, *guardrailRetries, *guardrailThreshold, *noSpecialists, *ragAutoIngest)
+		return cmdRunParallel(ctx, router, cfg, task, *supervisorRole, poolAliases, *noSynthesize, *noReviewer, *noTester, *iterate, *maxIterations, *maxSubtasks, *outputDir, runLogDir, *ragURL, *ragCollection, *ragEmbedURL, *jinaKey, *noCoordinate, *guardrailRetries, *guardrailThreshold, *noSpecialists, *ragAutoIngest, bus)
 	}
 
 	// Legacy single-worker flow (no pool configured).
@@ -347,7 +385,7 @@ func cmdRun(args []string) error {
 //	0. RAG (optional)  0.5. Jina fetch (optional)  1. Decompose  2. Parallel workers
 //	2.5. Reviewer (optional)  3. Synthesize  4. Tester (optional)
 //	5. Build/fix loop (optional, requires --iterate)
-func cmdRunParallel(ctx context.Context, router *provider.Router, cfg *provider.Config, task, supervisorRole string, poolAliases []string, noSynthesize, noReviewer, noTester, iterate bool, maxIterations, maxSubtasks int, outputDir, runLogDir, ragURL, ragCollection, ragEmbedURL, jinaKey string, noCoordinate bool, guardrailRetries, guardrailThreshold int, noSpecialists, ragAutoIngest bool) error {
+func cmdRunParallel(ctx context.Context, router *provider.Router, cfg *provider.Config, task, supervisorRole string, poolAliases []string, noSynthesize, noReviewer, noTester, iterate bool, maxIterations, maxSubtasks int, outputDir, runLogDir, ragURL, ragCollection, ragEmbedURL, jinaKey string, noCoordinate bool, guardrailRetries, guardrailThreshold int, noSpecialists, ragAutoIngest bool, bus *event.Bus) error {
 	// Shared cost tracker for all roles in this run.
 	tracker := cost.NewTracker(cost.DefaultPricing())
 
@@ -381,7 +419,7 @@ func cmdRunParallel(ctx context.Context, router *provider.Router, cfg *provider.
 		if err != nil {
 			return fmt.Errorf("getting working directory for auto-ingest: %w", err)
 		}
-		fmt.Printf("Phase -1: Auto-ingesting %s into RAG collection '%s'...\n", cwd, ragCollection)
+		bus.Emit(event.PhaseStarted, event.PhaseData{Name: fmt.Sprintf("Phase -1: Auto-ingesting %s into RAG collection '%s'...", cwd, ragCollection)})
 		ingestClient := rag.NewClient(ragURL, ragCollection)
 		if err := ingestClient.EnsureCollection(ctx, rag.DefaultEmbedVectorSize); err != nil {
 			fmt.Fprintf(os.Stderr, "  warning: RAG auto-ingest ensure collection failed: %v — continuing without ingest\n", err)
@@ -392,17 +430,17 @@ func cmdRunParallel(ctx context.Context, router *provider.Router, cfg *provider.
 			if ingestErr != nil {
 				fmt.Fprintf(os.Stderr, "  warning: RAG auto-ingest failed: %v — continuing without ingest\n", ingestErr)
 			} else {
-				fmt.Printf("  Auto-ingested %d chunks\n", total)
+				bus.Emit(event.RAGIngest, event.RAGData{Collection: ragCollection, Count: total})
 			}
 		}
-		fmt.Println()
+		bus.Emit(event.PhaseCompleted, event.PhaseData{Name: "Phase -1"})
 	}
 
 	// Phase 0: RAG context retrieval (optional — only when --rag-url is set).
 	ragContext := ""
 	workerRAGContext := ""
 	if ragURL != "" {
-		fmt.Printf("Phase 0: RAG context retrieval from %s (collection: %s)...\n", ragURL, ragCollection)
+		bus.Emit(event.PhaseStarted, event.PhaseData{Name: fmt.Sprintf("Phase 0: RAG context retrieval from %s (collection: %s)...", ragURL, ragCollection)})
 		ragClient := rag.NewClient(ragURL, ragCollection)
 		ragEmbedder := rag.NewEmbedder(ragEmbedURL, rag.DefaultEmbedModel)
 		retriever := rag.NewRetriever(ragClient, ragEmbedder)
@@ -412,9 +450,9 @@ func cmdRunParallel(ctx context.Context, router *provider.Router, cfg *provider.
 		} else {
 			ragContext = retriever.FormatContext(results)
 			workerRAGContext = ragContext
-			fmt.Printf("  Retrieved %d chunks\n", len(results))
+			bus.Emit(event.RAGQuery, event.RAGData{Collection: ragCollection, Count: len(results)})
 		}
-		fmt.Println()
+		bus.Emit(event.PhaseCompleted, event.PhaseData{Name: "Phase 0"})
 	}
 
 	// Augment the task with RAG context for the mayor decompose call.
@@ -430,7 +468,7 @@ func cmdRunParallel(ctx context.Context, router *provider.Router, cfg *provider.
 		resolvedJinaKey = os.Getenv("JINA_API_KEY")
 	}
 	if resolvedJinaKey != "" {
-		fmt.Printf("Phase 0.5: Mayor assessing knowledge staleness...\n")
+		bus.Emit(event.PhaseStarted, event.PhaseData{Name: "Phase 0.5: Mayor assessing knowledge staleness..."})
 		pt.start("Phase 0.5 assess")
 		stopSpin05 := startSpinner(spinLabelWithToks("  assessing", tracker))
 		assess, assessErr := mayor.Assess(ctx, task)
@@ -438,22 +476,21 @@ func cmdRunParallel(ctx context.Context, router *provider.Router, cfg *provider.
 		if assessErr != nil {
 			fmt.Fprintf(os.Stderr, "  warning: mayor assess failed: %v — continuing without Jina fetch\n", assessErr)
 		} else {
-			fmt.Printf("  Staleness risk: %s\n", assess.StalenessRisk)
+			fmt.Fprintf(os.Stderr, "  Staleness risk: %s\n", assess.StalenessRisk)
 			if len(assess.FetchURLs) > 0 {
-				fmt.Printf("  Fetching %d URL(s) via Jina Reader...\n", len(assess.FetchURLs))
 				jinaClient := jina.New(resolvedJinaKey)
 				var jinaBuilder strings.Builder
 				for _, u := range assess.FetchURLs {
 					content, fetchErr := jinaClient.FetchURL(ctx, u)
 					if fetchErr != nil {
-						fmt.Fprintf(os.Stderr, "  warning: Jina fetch %s: %v\n", u, fetchErr)
+						bus.Emit(event.JinaFetch, event.JinaFetchData{URL: u, Error: fetchErr.Error()})
 						continue
 					}
 					if len(content) > 8192 {
 						content = content[:8192]
 					}
 					jinaBuilder.WriteString(fmt.Sprintf("=== Fetched: %s ===\n%s\n\n", u, content))
-					fmt.Printf("  ✓ fetched %s (%d chars)\n", u, len(content))
+					bus.Emit(event.JinaFetch, event.JinaFetchData{URL: u, Length: len(content)})
 				}
 				if jinaBuilder.Len() > 0 {
 					fetched := jinaBuilder.String()
@@ -463,11 +500,11 @@ func cmdRunParallel(ctx context.Context, router *provider.Router, cfg *provider.
 			}
 		}
 		pt.stop()
-		fmt.Println()
+		bus.Emit(event.PhaseCompleted, event.PhaseData{Name: "Phase 0.5"})
 	}
 
 	// Phase 1: Decompose (with spinner showing live token count).
-	fmt.Printf("Phase 1: Supervisor (%s) decomposing task...\n", supervisorRole)
+	bus.Emit(event.PhaseStarted, event.PhaseData{Name: fmt.Sprintf("Phase 1: Supervisor (%s) decomposing task...", supervisorRole)})
 	pt.start("Phase 1 decompose")
 	stopSpin1 := startSpinner(spinLabelWithToks("  decomposing", tracker))
 	subtasks, err := mayor.Decompose(ctx, decomposeTask)
@@ -488,21 +525,18 @@ func cmdRunParallel(ctx context.Context, router *provider.Router, cfg *provider.
 		Detail:  truncate(task, 120),
 	})
 
-	fmt.Printf("  Subtasks: %d\n", len(subtasks))
-	for i, st := range subtasks {
-		fmt.Printf("  [%d] %s\n", i+1, truncate(st, 100))
-	}
-	if hasDeps {
-		fmt.Printf("  Dependencies detected — will execute in waves\n")
-	}
+	bus.Emit(event.SubtaskDecomposed, event.SubtaskDecomposedData{
+		Subtasks: subtasks,
+		HasDeps:  hasDeps,
+	})
 	pt.stop()
-	fmt.Println()
+	bus.Emit(event.PhaseCompleted, event.PhaseData{Name: "Phase 1"})
 
 	// Phase 1.25: Specialist resolution (when specialists are configured).
 	var resolvedModels []string
 	var resolvedFallbacks [][]string
 	if hasSpecialists {
-		fmt.Printf("Phase 1.25: Resolving specialist assignments...\n")
+		bus.Emit(event.PhaseStarted, event.PhaseData{Name: "Phase 1.25: Resolving specialist assignments..."})
 		specialistNames := cfg.SpecialistNames()
 		resolvedModels = make([]string, len(subtasks))
 		resolvedFallbacks = make([][]string, len(subtasks))
@@ -513,7 +547,7 @@ func cmdRunParallel(ctx context.Context, router *provider.Router, cfg *provider.
 			if assigned == "" {
 				// No marker — use default pool via balancer (empty override).
 				resolvedModels[i] = ""
-				fmt.Printf("  [%d] → general-default\n", i+1)
+				bus.Emit(event.SpecialistAssigned, event.SpecialistAssignedData{Index: i, Specialist: "", Model: ""})
 				continue
 			}
 
@@ -528,6 +562,7 @@ func cmdRunParallel(ctx context.Context, router *provider.Router, cfg *provider.
 				} else {
 					fmt.Fprintf(os.Stderr, "  ⚠ [%d] specialist %q not found, falling back to general-default\n", i+1, assigned)
 					resolvedModels[i] = ""
+					bus.Emit(event.SpecialistAssigned, event.SpecialistAssignedData{Index: i, Specialist: "", Model: ""})
 
 					decLog.Log(decision.Decision{
 						Phase:   "specialist-resolve",
@@ -556,7 +591,7 @@ func cmdRunParallel(ctx context.Context, router *provider.Router, cfg *provider.
 				resolvedFallbacks[i] = spec.Fallbacks
 			}
 
-			fmt.Printf("  [%d] → %s (%s)\n", i+1, assigned, resolvedModels[i])
+			bus.Emit(event.SpecialistAssigned, event.SpecialistAssignedData{Index: i, Specialist: assigned, Model: resolvedModels[i]})
 
 			decLog.Log(decision.Decision{
 				Phase:   "specialist-resolve",
@@ -567,7 +602,7 @@ func cmdRunParallel(ctx context.Context, router *provider.Router, cfg *provider.
 				Detail:  truncate(st, 120),
 			})
 		}
-		fmt.Println()
+		bus.Emit(event.PhaseCompleted, event.PhaseData{Name: "Phase 1.25"})
 	}
 
 	// Phase 1.5: Coordination brief (optional — skipped if --no-coordinate).
@@ -576,7 +611,7 @@ func cmdRunParallel(ctx context.Context, router *provider.Router, cfg *provider.
 		workerSystemPrompt = workerRAGContext + "\n---\n\n" + workerSystemPrompt
 	}
 	if !noCoordinate && len(subtasks) > 1 {
-		fmt.Printf("Phase 1.5: Mayor producing coordination brief...\n")
+		bus.Emit(event.PhaseStarted, event.PhaseData{Name: "Phase 1.5: Mayor producing coordination brief..."})
 		pt.start("Phase 1.5 coordinate")
 		stopSpin15 := startSpinner(spinLabelWithToks("  coordinating", tracker))
 		brief, coordErr := mayor.Coordinate(ctx, task, subtasks)
@@ -585,10 +620,9 @@ func cmdRunParallel(ctx context.Context, router *provider.Router, cfg *provider.
 			fmt.Fprintf(os.Stderr, "  warning: coordination brief failed: %v — continuing without\n", coordErr)
 		} else if brief != "" {
 			workerSystemPrompt = "## Project Coordination\n" + brief + "\n---\n\n" + workerSystemPrompt
-			fmt.Printf("  ✓ coordination brief injected (%d chars)\n", len(brief))
 		}
 		pt.stop()
-		fmt.Println()
+		bus.Emit(event.PhaseCompleted, event.PhaseData{Name: "Phase 1.5"})
 	}
 
 	// Initialize response cache for deduplication in build/fix iterations.
@@ -618,7 +652,7 @@ func cmdRunParallel(ctx context.Context, router *provider.Router, cfg *provider.
 	var results []role.WorkerResult
 	pt.start("Phase 2 workers")
 	if hasDeps {
-		fmt.Printf("Phase 2: Workers executing with dependency ordering (%d subtasks, %d pool members)...\n", n, len(poolAliases))
+		bus.Emit(event.PhaseStarted, event.PhaseData{Name: fmt.Sprintf("Phase 2: Workers executing with dependency ordering (%d subtasks, %d pool members)...", n, len(poolAliases))})
 		var dagErr error
 		if resolvedModels != nil {
 			results, dagErr = wp.ExecuteDAGWithModels(ctx, subtasks, deps, resolvedModels, resolvedFallbacks, workerSystemPrompt)
@@ -629,7 +663,7 @@ func cmdRunParallel(ctx context.Context, router *provider.Router, cfg *provider.
 			return fmt.Errorf("DAG execution failed: %w", dagErr)
 		}
 	} else {
-		fmt.Printf("Phase 2: Workers executing in parallel (%d subtasks, %d pool members)...\n", n, len(poolAliases))
+		bus.Emit(event.PhaseStarted, event.PhaseData{Name: fmt.Sprintf("Phase 2: Workers executing in parallel (%d subtasks, %d pool members)...", n, len(poolAliases))})
 		if resolvedModels != nil {
 			results = wp.ExecuteAllWithModels(ctx, subtasks, resolvedModels, resolvedFallbacks, workerSystemPrompt)
 		} else {
@@ -637,7 +671,7 @@ func cmdRunParallel(ctx context.Context, router *provider.Router, cfg *provider.
 		}
 	}
 	pt.stop()
-	fmt.Println()
+	bus.Emit(event.PhaseCompleted, event.PhaseData{Name: "Phase 2"})
 
 	// Phase 2.25: Structured output validation (when --output-dir is set).
 	if outputDir != "" {
@@ -651,7 +685,7 @@ func cmdRunParallel(ctx context.Context, router *provider.Router, cfg *provider.
 				continue
 			}
 			validationRetried++
-			fmt.Printf("  ⚠ worker[%d] output validation failed: %s\n", i+1, strings.Join(valErrs, "; "))
+			bus.Emit(event.ValidationResult, event.ValidationData{Index: i, Passed: false, Errors: valErrs})
 			// Retry once with validation feedback.
 			retryPrompt := fmt.Sprintf(
 				"Your previous output had format errors:\n%s\n\nOriginal subtask: %s\n\nPlease output corrected files using ===FILE: path=== ... ===ENDFILE=== format.",
@@ -671,7 +705,7 @@ func cmdRunParallel(ctx context.Context, router *provider.Router, cfg *provider.
 			}
 			results[i].Response = resp.Message.Content
 			results[i].Tokens += resp.Usage.TotalTokens
-			fmt.Printf("  ✓ worker[%d] re-submitted after validation fix\n", i+1)
+			bus.Emit(event.ValidationResult, event.ValidationData{Index: i, Passed: true})
 		}
 		if validationRetried > 0 {
 			fmt.Println()
@@ -681,7 +715,7 @@ func cmdRunParallel(ctx context.Context, router *provider.Router, cfg *provider.
 	// Phase 2.5: Reviewer + guardrail retries (optional).
 	if !noReviewer {
 		if _, ok := cfg.Roles["reviewer"]; ok {
-			fmt.Printf("Phase 2.5: Reviewer scoring worker outputs...\n")
+			bus.Emit(event.PhaseStarted, event.PhaseData{Name: "Phase 2.5: Reviewer scoring worker outputs..."})
 			pt.start("Phase 2.5 reviewer")
 			reviewer := role.NewReviewer(router, role.WithWitnessCostTracker(tracker))
 			for i := range results {
@@ -713,8 +747,10 @@ func cmdRunParallel(ctx context.Context, router *provider.Router, cfg *provider.
 				retryCount := 0
 				for results[i].Flagged && retryCount < guardrailRetries {
 					retryCount++
-					fmt.Printf("  [%d/%d] score=%d/10 ⚑ retrying (%d/%d): %s\n",
-						i+1, len(results), score, retryCount, guardrailRetries, truncate(note, 60))
+					bus.Emit(event.GuardrailRetry, event.GuardrailRetryData{
+						Index: i, Attempt: retryCount, MaxRetries: guardrailRetries,
+						Score: score, Note: truncate(note, 60),
+					})
 					retryPrompt := fmt.Sprintf(
 						"Your previous output scored %d/10. Reviewer feedback: %s\n\nOriginal subtask: %s\n\nPlease revise your output to address the reviewer's feedback.",
 						score, note, results[i].Subtask,
@@ -768,14 +804,17 @@ func cmdRunParallel(ctx context.Context, router *provider.Router, cfg *provider.
 					})
 				}
 
-				flag := "✓"
-				if results[i].Flagged {
-					flag = "⚑"
-				}
-				fmt.Printf("  [%d/%d] score=%d/10 %s %s\n", i+1, len(results), results[i].ReviewScore, flag, truncate(results[i].ReviewNote, 80))
+				bus.Emit(event.WorkerCompleted, event.WorkerData{
+					Index:   i,
+					Total:   len(results),
+					Model:   results[i].Role,
+					Tokens:  results[i].Tokens,
+					Score:   results[i].ReviewScore,
+					Flagged: results[i].Flagged,
+				})
 			}
 			pt.stop()
-			fmt.Println()
+			bus.Emit(event.PhaseCompleted, event.PhaseData{Name: "Phase 2.5"})
 		} else {
 			fmt.Fprintf(os.Stderr, "  note: reviewer role not configured — skipping Phase 2.5\n")
 		}
@@ -797,7 +836,7 @@ func cmdRunParallel(ctx context.Context, router *provider.Router, cfg *provider.
 		return nil
 	}
 
-	fmt.Printf("Phase 3: Supervisor synthesizing results...\n")
+	bus.Emit(event.PhaseStarted, event.PhaseData{Name: "Phase 3: Supervisor synthesizing results..."})
 	pt.start("Phase 3 synthesize")
 	stopSpin3 := startSpinner(spinLabelWithToks("  synthesizing", tracker))
 	synthesis, err := mayor.Synthesize(ctx, task, results)
@@ -810,7 +849,7 @@ func cmdRunParallel(ctx context.Context, router *provider.Router, cfg *provider.
 	// Phase 4: Tester polish (optional — skipped if --no-tester or role not configured).
 	if !noTester {
 		if _, ok := cfg.Roles["tester"]; ok {
-			fmt.Printf("Phase 4: Tester polishing synthesized output...\n")
+			bus.Emit(event.PhaseStarted, event.PhaseData{Name: "Phase 4: Tester polishing synthesized output..."})
 			pt.start("Phase 4 tester")
 			stopSpin4 := startSpinner(spinLabelWithToks("  refining", tracker))
 			tester := role.NewTester(router, role.WithRefineryCostTracker(tracker))
@@ -853,7 +892,7 @@ func cmdRunParallel(ctx context.Context, router *provider.Router, cfg *provider.
 		if runner == nil {
 			fmt.Fprintf(os.Stderr, "  note: no build system detected in %s — skipping Phase 5\n", outputDir)
 		} else {
-			fmt.Printf("Phase 5: Iterative build/fix loop (%s, max %d iterations)...\n", runner.Name(), maxIterations)
+			bus.Emit(event.PhaseStarted, event.PhaseData{Name: fmt.Sprintf("Phase 5: Iterative build/fix loop (%s, max %d iterations)...", runner.Name(), maxIterations)})
 			buildDoom := pool.NewDoomLoop()
 			buildOK := false
 			for iter := 1; iter <= maxIterations; iter++ {
