@@ -8,6 +8,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/meganerd/electrictown/internal/agent"
 	"github.com/meganerd/electrictown/internal/cost"
 	"github.com/meganerd/electrictown/internal/provider"
 )
@@ -49,6 +50,7 @@ type Mayor struct {
 	systemPrompt string
 	maxSubtasks  int
 	specialists  map[string]provider.SpecialistConfig // nil when no specialists configured
+	agentBackend agent.Backend                        // optional: when set, bypasses Router for all calls
 }
 
 const defaultMayorSystemPrompt = `You are a software architect decomposing a task into implementation subtasks for parallel coding workers.
@@ -101,6 +103,15 @@ func WithMayorCostTracker(t *cost.Tracker) MayorOption {
 func WithMayorMaxSubtasks(n int) MayorOption {
 	return func(m *Mayor) {
 		m.maxSubtasks = n
+	}
+}
+
+// WithMayorAgentBackend sets an agent backend for the mayor. When set, the
+// mayor sends all prompts through the agent CLI instead of the LLM API Router.
+// This enables using coding agents (Claude Code, Codex, skills) as mayors.
+func WithMayorAgentBackend(b agent.Backend) MayorOption {
+	return func(m *Mayor) {
+		m.agentBackend = b
 	}
 }
 
@@ -166,7 +177,7 @@ func (m *Mayor) Decompose(ctx context.Context, task string) ([]string, error) {
 		},
 	}
 
-	resp, err := m.router.ChatCompletionForRole(ctx, m.role, req)
+	resp, err := m.sendPrompt(ctx, req)
 	if err != nil {
 		return nil, err
 	}
@@ -201,7 +212,7 @@ func (m *Mayor) Synthesize(ctx context.Context, task string, results []WorkerRes
 		},
 	}
 
-	resp, err := m.router.ChatCompletionForRole(ctx, m.role, req)
+	resp, err := m.sendPrompt(ctx, req)
 	if err != nil {
 		return "", err
 	}
@@ -222,7 +233,7 @@ func (m *Mayor) Plan(ctx context.Context, task string) (*PlanResult, error) {
 		},
 	}
 
-	resp, err := m.router.ChatCompletionForRole(ctx, m.role, req)
+	resp, err := m.sendPrompt(ctx, req)
 	if err != nil {
 		return nil, err
 	}
@@ -294,7 +305,7 @@ func (m *Mayor) Assess(ctx context.Context, task string) (*AssessResult, error) 
 		},
 	}
 
-	resp, err := m.router.ChatCompletionForRole(ctx, m.role, req)
+	resp, err := m.sendPrompt(ctx, req)
 	if err != nil {
 		return nil, err
 	}
@@ -362,13 +373,56 @@ func (m *Mayor) Coordinate(ctx context.Context, task string, subtasks []string) 
 		},
 	}
 
-	resp, err := m.router.ChatCompletionForRole(ctx, m.role, req)
+	resp, err := m.sendPrompt(ctx, req)
 	if err != nil {
 		return "", err
 	}
 
 	m.recordCost(resp)
 	return strings.TrimSpace(resp.Message.Content), nil
+}
+
+// sendPrompt routes a request through the agent backend (if set) or the Router.
+// When using an agent backend, it combines the system + user messages into a
+// single prompt and executes via the agent CLI.
+func (m *Mayor) sendPrompt(ctx context.Context, req *provider.ChatRequest) (*provider.ChatResponse, error) {
+	if m.agentBackend != nil {
+		return m.sendViaAgent(ctx, req)
+	}
+	return m.router.ChatCompletionForRole(ctx, m.role, req)
+}
+
+// sendViaAgent executes a chat request through the agent backend.
+func (m *Mayor) sendViaAgent(ctx context.Context, req *provider.ChatRequest) (*provider.ChatResponse, error) {
+	// Build a combined prompt from system + user messages.
+	var prompt strings.Builder
+	for _, msg := range req.Messages {
+		switch msg.Role {
+		case provider.RoleSystem:
+			prompt.WriteString("## Instructions\n\n")
+			prompt.WriteString(msg.Content)
+			prompt.WriteString("\n\n")
+		case provider.RoleUser:
+			prompt.WriteString("## Task\n\n")
+			prompt.WriteString(msg.Content)
+			prompt.WriteString("\n\n")
+		}
+	}
+
+	task := agent.Task{Prompt: prompt.String()}
+	result, err := m.agentBackend.Execute(ctx, task)
+	if err != nil {
+		return nil, fmt.Errorf("agent %s: %w", m.agentBackend.Type(), err)
+	}
+	if result.ExitCode != 0 {
+		return nil, fmt.Errorf("agent %s exited %d: %s", m.agentBackend.Type(), result.ExitCode, result.Stderr)
+	}
+
+	return &provider.ChatResponse{
+		Model:   string(m.agentBackend.Type()),
+		Message: provider.Message{Role: provider.RoleAssistant, Content: result.Stdout},
+		Done:    true,
+	}, nil
 }
 
 // recordCost records token usage with the cost tracker if one is configured.

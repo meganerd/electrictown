@@ -9,6 +9,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/meganerd/electrictown/internal/agent"
 	"github.com/meganerd/electrictown/internal/provider"
 	"github.com/meganerd/electrictown/internal/role"
 )
@@ -16,10 +17,11 @@ import (
 // WorkerPool dispatches subtasks concurrently across a pool of model aliases.
 // It uses a Balancer for round-robin assignment and the Router for request routing.
 type WorkerPool struct {
-	router     *provider.Router
-	balancer   *provider.Balancer
-	aliases    []string                           // pool model aliases
-	onComplete func(idx int, r role.WorkerResult) // optional per-worker completion hook
+	router       *provider.Router
+	balancer     *provider.Balancer
+	aliases      []string                           // pool model aliases
+	onComplete   func(idx int, r role.WorkerResult) // optional per-worker completion hook
+	agentBackend agent.Backend                      // optional: when set, all workers use this agent instead of Router
 }
 
 // New creates a WorkerPool with the given router, balancer, and pool model aliases.
@@ -29,6 +31,12 @@ func New(router *provider.Router, balancer *provider.Balancer, aliases []string)
 		balancer: balancer,
 		aliases:  aliases,
 	}
+}
+
+// SetAgentBackend sets an agent backend for all workers. When set, workers
+// execute tasks through the agent CLI instead of the LLM API Router.
+func (wp *WorkerPool) SetAgentBackend(b agent.Backend) {
+	wp.agentBackend = b
 }
 
 // SetProgressHook registers a callback invoked when each worker finishes.
@@ -164,7 +172,40 @@ func (wp *WorkerPool) ExecuteAllWithModels(ctx context.Context, subtasks []strin
 			sem <- struct{}{}
 			defer func() { <-sem }()
 
-			// Use per-subtask model override if provided, otherwise balancer.
+			// Agent backend path: bypass Router, execute via CLI agent.
+			if wp.agentBackend != nil {
+				start := time.Now()
+				agentTask := agent.Task{
+					Prompt: fmt.Sprintf("## Instructions\n\n%s\n\n## Task\n\n%s", systemPrompt, task),
+				}
+				agentResult, agentErr := wp.agentBackend.Execute(ctx, agentTask)
+				elapsed := time.Since(start)
+
+				result := role.WorkerResult{
+					Role:    string(wp.agentBackend.Type()),
+					Subtask: task,
+					Elapsed: elapsed,
+				}
+				if agentErr != nil || (agentResult != nil && agentResult.ExitCode != 0) {
+					errMsg := ""
+					if agentErr != nil {
+						errMsg = agentErr.Error()
+					} else {
+						errMsg = agentResult.Stderr
+					}
+					result.Response = fmt.Sprintf("error: %s", errMsg)
+				} else if agentResult != nil {
+					result.Response = agentResult.Stdout
+				}
+
+				results[idx] = result
+				if wp.onComplete != nil {
+					wp.onComplete(idx, result)
+				}
+				return
+			}
+
+			// LLM API path: use Router with model selection.
 			alias := ""
 			if models != nil && idx < len(models) && models[idx] != "" {
 				alias = models[idx]

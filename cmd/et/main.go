@@ -23,6 +23,13 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/meganerd/electrictown/internal/agent"
+	"github.com/meganerd/electrictown/internal/agent/adapters/aider"
+	agentclaudecode "github.com/meganerd/electrictown/internal/agent/adapters/claudecode"
+	agentcodex "github.com/meganerd/electrictown/internal/agent/adapters/codex"
+	agentgeminicli "github.com/meganerd/electrictown/internal/agent/adapters/geminicli"
+	agentopencode "github.com/meganerd/electrictown/internal/agent/adapters/opencode"
+	agentskill "github.com/meganerd/electrictown/internal/agent/adapters/skill"
 	"github.com/meganerd/electrictown/internal/build"
 	"github.com/meganerd/electrictown/internal/cache"
 	"github.com/meganerd/electrictown/internal/cost"
@@ -250,6 +257,26 @@ func buildFactories() map[string]provider.ProviderFactory {
 	}
 }
 
+// buildAgentBackend creates an agent.Backend from an AgentConfig.
+func buildAgentBackend(ac *provider.AgentConfig) agent.Backend {
+	switch ac.Type {
+	case "claude-code":
+		return agentclaudecode.New()
+	case "codex":
+		return agentcodex.New()
+	case "aider":
+		return aider.New()
+	case "opencode":
+		return agentopencode.New()
+	case "gemini-cli":
+		return agentgeminicli.New()
+	case "skill":
+		return agentskill.New(ac.Command, ac.SkillPath, ac.InputMode)
+	default:
+		return nil
+	}
+}
+
 // cmdRun implements the "et run" subcommand.
 // When the worker role has a pool configured, it uses a three-phase pipeline:
 // decompose → parallel execute → synthesize. Otherwise, it falls back to the
@@ -442,6 +469,14 @@ func cmdRunParallel(ctx context.Context, router *provider.Router, cfg *provider.
 	hasSpecialists := !noSpecialists && len(cfg.Specialists) > 0
 	if hasSpecialists {
 		mayorOpts = append(mayorOpts, role.WithMayorSpecialists(cfg.Specialists))
+	}
+	// If the supervisor role targets an agent backend, wire it in.
+	if agentName, agentCfg, ok := cfg.RoleTargetsAgent(supervisorRole); ok {
+		backend := buildAgentBackend(agentCfg)
+		if backend != nil {
+			mayorOpts = append(mayorOpts, role.WithMayorAgentBackend(backend))
+			fmt.Fprintf(os.Stderr, "  Mayor using agent backend: %s (%s)\n", agentName, agentCfg.Type)
+		}
 	}
 	mayor := role.NewMayor(router, mayorOpts...)
 
@@ -665,6 +700,15 @@ func cmdRunParallel(ctx context.Context, router *provider.Router, cfg *provider.
 	n := len(subtasks)
 	balancer := provider.NewBalancer(provider.StrategyRoundRobin)
 	wp := pool.New(router, balancer, poolAliases)
+
+	// If the worker role targets an agent backend, wire it into the pool.
+	if agentName, agentCfg, ok := cfg.RoleTargetsAgent("polecat"); ok {
+		backend := buildAgentBackend(agentCfg)
+		if backend != nil {
+			wp.SetAgentBackend(backend)
+			fmt.Fprintf(os.Stderr, "  Workers using agent backend: %s (%s)\n", agentName, agentCfg.Type)
+		}
+	}
 
 	lp := newLiveProgress(n)
 	wp.SetProgressHook(func(idx int, r role.WorkerResult) {
