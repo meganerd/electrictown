@@ -164,14 +164,10 @@ func (l *SessionLauncher) Stop(sessionID string) error {
 // executor returns the configured Executor, lazily creating a SubprocessExecutor
 // if none was set. This preserves backward compatibility for existing callers.
 func (l *SessionLauncher) executor() Executor {
-	if l.exec != nil {
-		return l.exec
-	}
-	// Lazy init with default SubprocessExecutor.
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	if l.exec == nil {
-		l.exec = NewSubprocessExecutor(l.adapter)
-	}
+	l.execOnce.Do(func() {
+		if l.exec == nil {
+			l.exec = NewSubprocessExecutor(l.adapter)
+		}
+	})
 	return l.exec
 }
