@@ -1,0 +1,39 @@
+stages:
+  - test
+  - build
+
+variables:
+  GOPATH: ${CI_PROJECT_DIR}/.go
+  GOFLAGS: "-mod=readonly"
+
+default:
+  image: golang:1.24
+  tags:
+    - docker
+  cache:
+    key: ${CI_COMMIT_REF_SLUG}
+    paths:
+      - .go/pkg/mod/
+
+test:
+  stage: test
+  script:
+    - go test ./... -v -race -coverprofile=coverage.out
+    - go tool cover -func=coverage.out
+
+lint:
+  stage: test
+  script:
+    - go vet ./...
+
+build:
+  stage: build
+  script:
+    - go build -ldflags "-X main.version=${CI_COMMIT_TAG:-${CI_COMMIT_SHORT_SHA}}" -o et ./cmd/et/
+  artifacts:
+    paths:
+      - et
+    expire_in: 1 week
+  needs:
+    - test
+    - lint
