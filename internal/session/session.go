@@ -94,6 +94,7 @@ type ProviderAdapter interface {
 type SessionLauncher struct {
 	adapter  ProviderAdapter
 	exec     Executor // optional; defaults to SubprocessExecutor
+	execOnce sync.Once
 	sessions map[string]*Session
 	mu       sync.RWMutex
 }
