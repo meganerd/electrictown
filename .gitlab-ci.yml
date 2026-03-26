@@ -1,6 +1,7 @@
 stages:
   - test
   - build
+  - security
 
 variables:
   GOPATH: ${CI_PROJECT_DIR}/.go
@@ -39,3 +40,17 @@ build:
   needs:
     - test
     - lint
+
+security:
+  stage: security
+  image: golang:1.26
+  script:
+    - go install golang.org/x/vuln/cmd/govulncheck@latest
+    - govulncheck ./...
+  allow_failure: true
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "schedule"
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+      changes:
+        - go.mod
+        - go.sum
