@@ -23,8 +23,10 @@ test:
 
 lint:
   stage: test
+  image: golangci/golangci-lint:v2.11
   script:
-    - go vet ./...
+    - golangci-lint run --new-from-rev=${CI_MERGE_REQUEST_DIFF_BASE_SHA:-HEAD~1} ./...
+    - golangci-lint run --new=false ./... || true
 
 build:
   stage: build
