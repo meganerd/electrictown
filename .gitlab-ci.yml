@@ -46,7 +46,7 @@ security:
   image: golang:1.26
   script:
     - go install golang.org/x/vuln/cmd/govulncheck@latest
-    - govulncheck ./...
+    - $GOPATH/bin/govulncheck ./...
   allow_failure: true
   rules:
     - if: $CI_PIPELINE_SOURCE == "schedule"
