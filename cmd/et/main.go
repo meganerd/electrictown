@@ -1484,7 +1484,7 @@ func writeWorkerFiles(files []FileOutput, workerIdx int, outputDir, logDir strin
 			if err := writeOutputFile(outputDir, f.Name, f.Content); err != nil {
 				fmt.Fprintf(os.Stderr, "  warning: could not write %s: %v\n", f.Name, err)
 			} else {
-				fmt.Printf("  → wrote %s\n", filepath.Join(outputDir, f.Name))
+				fmt.Fprintf(os.Stderr, "  → wrote %s\n", filepath.Join(outputDir, f.Name))
 				written[f.Name] = struct{}{}
 			}
 		}
@@ -1496,7 +1496,7 @@ func writeWorkerFiles(files []FileOutput, workerIdx int, outputDir, logDir strin
 		if err := writeOutputFile(logDir, logFile, raw); err != nil {
 			fmt.Fprintf(os.Stderr, "  warning: could not write log %s: %v\n", logFile, err)
 		} else {
-			fmt.Printf("  → logged %s\n", filepath.Join(logDir, logFile))
+			fmt.Fprintf(os.Stderr, "  → logged %s\n", filepath.Join(logDir, logFile))
 		}
 	}
 	return written
