@@ -60,6 +60,106 @@ The `--iterate` flag makes `et` attempt `go build ./...` (or equivalent) after s
 and re-dispatch fix subtasks to the specific workers whose files caused errors. This loops
 up to `--max-iterations` times without agent intervention.
 
+### Claude Code as an et role (v1.4+)
+
+Claude Code can be used as any et role — mayor, worker, reviewer, or tester — via
+the `agents:` section in your YAML config. This gives each role its own system prompt,
+tool restrictions, permission mode, and budget cap.
+
+#### Worker role with read/write access
+
+```yaml
+agents:
+  cc-worker:
+    type: claude-code
+    model: sonnet
+    permission_mode: bypassPermissions
+    max_budget_usd: 2.00
+    timeout: 1800
+
+roles:
+  polecat:
+    agent: cc-worker
+```
+
+#### Mayor role with read-only tools
+
+```yaml
+agents:
+  cc-mayor:
+    type: claude-code
+    model: opus
+    permission_mode: plan
+    system_prompt: >
+      You are a project coordinator. Analyze tasks and decompose them into
+      subtasks with [depends: N] markers for DAG execution.
+    allowed_tools:
+      - Read
+      - Glob
+      - Grep
+    max_budget_usd: 0.50
+    timeout: 300
+
+roles:
+  mayor:
+    agent: cc-mayor
+```
+
+#### Reviewer role with structured JSON output
+
+```yaml
+agents:
+  cc-reviewer:
+    type: claude-code
+    model: opus
+    permission_mode: plan
+    system_prompt: >
+      Review the code output for correctness, style, and completeness.
+      Score from 0-10 and provide actionable feedback.
+    allowed_tools:
+      - Read
+      - Glob
+      - Grep
+      - "Bash(test:*)"
+    json_schema: >
+      {"type":"object","properties":{"score":{"type":"number"},
+      "feedback":{"type":"string"},"pass":{"type":"boolean"}},
+      "required":["score","feedback","pass"]}
+    max_budget_usd: 1.00
+    timeout: 600
+
+roles:
+  reviewer:
+    agent: cc-reviewer
+```
+
+#### Multi-directory access
+
+```yaml
+agents:
+  cc-full:
+    type: claude-code
+    model: sonnet
+    add_dirs:
+      - /data/shared-libs
+      - /data/test-fixtures
+    working_dir: /data/myproject
+```
+
+#### Available Claude Code config fields
+
+| Field | Type | CLI Flag | Description |
+|-------|------|----------|-------------|
+| `system_prompt` | string | `--system-prompt` | System prompt for the role |
+| `allowed_tools` | string[] | `--allowedTools` | Tools to allow (whitelist) |
+| `disallowed_tools` | string[] | `--disallowedTools` | Tools to deny (blacklist) |
+| `json_schema` | string | `--json-schema` | JSON Schema for structured output |
+| `permission_mode` | string | `--permission-mode` | default, plan, acceptEdits, bypassPermissions, dontAsk, auto |
+| `max_budget_usd` | float | `--max-budget-usd` | Max dollar spend per invocation |
+| `add_dirs` | string[] | `--add-dir` | Additional directories for tool access |
+
+These fields are validated at config load time and only allowed on `type: claude-code` agents.
+
 ---
 
 ## Codex / OpenAI Agents integration

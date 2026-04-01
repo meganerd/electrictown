@@ -98,6 +98,15 @@ type AgentConfig struct {
 	SSHPort    int               `yaml:"ssh_port,omitempty"`    // SSH port (default: 22)
 	SkillPath  string            `yaml:"skill_path,omitempty"`  // path to skill script (type: skill only)
 	InputMode  string            `yaml:"input_mode,omitempty"`  // how to deliver task: "arg" (default) or "stdin" (type: skill only)
+
+	// Claude Code-specific fields (type: claude-code only).
+	SystemPrompt   string   `yaml:"system_prompt,omitempty"`   // system prompt for --system-prompt flag
+	AllowedTools   []string `yaml:"allowed_tools,omitempty"`   // tools to allow via --allowedTools flag
+	DisallowedTools []string `yaml:"disallowed_tools,omitempty"` // tools to deny via --disallowedTools flag
+	JSONSchema     string   `yaml:"json_schema,omitempty"`     // JSON schema for --json-schema flag (structured output)
+	PermissionMode string   `yaml:"permission_mode,omitempty"` // permission mode: default, plan, bypassPermissions, etc.
+	MaxBudgetUSD   float64  `yaml:"max_budget_usd,omitempty"`  // max dollar spend per invocation via --max-budget-usd
+	AddDirs        []string `yaml:"add_dirs,omitempty"`        // additional directories for --add-dir flags
 }
 
 // AgentTransport constants.
@@ -294,6 +303,26 @@ func (c *Config) Validate() error {
 		// Validate input_mode if set.
 		if ac.InputMode != "" && ac.InputMode != "arg" && ac.InputMode != "stdin" {
 			return fmt.Errorf("config: agent %q has invalid input_mode %q (must be arg or stdin)", name, ac.InputMode)
+		}
+		// Validate Claude Code-specific fields.
+		if ac.PermissionMode != "" {
+			validModes := map[string]bool{
+				"default": true, "plan": true, "acceptEdits": true,
+				"bypassPermissions": true, "dontAsk": true, "auto": true,
+			}
+			if !validModes[ac.PermissionMode] {
+				return fmt.Errorf("config: agent %q has invalid permission_mode %q", name, ac.PermissionMode)
+			}
+		}
+		if ac.MaxBudgetUSD < 0 {
+			return fmt.Errorf("config: agent %q has negative max_budget_usd %g", name, ac.MaxBudgetUSD)
+		}
+		// Warn if Claude Code-specific fields are set on non-claude-code agents.
+		if ac.Type != "claude-code" {
+			if ac.SystemPrompt != "" || len(ac.AllowedTools) > 0 || len(ac.DisallowedTools) > 0 ||
+				ac.JSONSchema != "" || ac.PermissionMode != "" || ac.MaxBudgetUSD > 0 || len(ac.AddDirs) > 0 {
+				return fmt.Errorf("config: agent %q has claude-code-specific fields but type is %q", name, ac.Type)
+			}
 		}
 		// Resolve env var references in agent env.
 		for k, v := range ac.Env {

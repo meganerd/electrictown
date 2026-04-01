@@ -262,7 +262,23 @@ func buildFactories() map[string]provider.ProviderFactory {
 func buildAgentBackend(ac *provider.AgentConfig) agent.Backend {
 	switch ac.Type {
 	case "claude-code":
-		return agentclaudecode.New()
+		cfg := agentclaudecode.Config{
+			Model:           ac.Model,
+			Flags:           ac.Flags,
+			WorkingDir:      ac.WorkingDir,
+			Env:             ac.Env,
+			SystemPrompt:    ac.SystemPrompt,
+			AllowedTools:    ac.AllowedTools,
+			DisallowedTools: ac.DisallowedTools,
+			JSONSchema:      ac.JSONSchema,
+			PermissionMode:  ac.PermissionMode,
+			MaxBudgetUSD:    ac.MaxBudgetUSD,
+			AddDirs:         ac.AddDirs,
+		}
+		if ac.Timeout > 0 {
+			cfg.Timeout = time.Duration(ac.Timeout) * time.Second
+		}
+		return agentclaudecode.New(cfg)
 	case "codex":
 		return agentcodex.New()
 	case "aider":

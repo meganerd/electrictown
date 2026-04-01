@@ -920,6 +920,176 @@ defaults:
 	}
 }
 
+// ═══════════════════════════════════════════════════════════════════
+// Claude Code agent config field validation tests
+// ═══════════════════════════════════════════════════════════════════
+
+func TestAgentConfig_InvalidPermissionMode(t *testing.T) {
+	bad := []byte(`
+providers:
+  ollama:
+    type: ollama
+    base_url: http://localhost:11434
+models:
+  m:
+    provider: ollama
+    model: llama3
+agents:
+  cc:
+    type: claude-code
+    permission_mode: yolo
+roles:
+  polecat:
+    agent: cc
+defaults:
+  model: m
+`)
+	_, err := ParseConfig(bad)
+	if err == nil {
+		t.Error("expected validation error for invalid permission_mode")
+	}
+}
+
+func TestAgentConfig_ValidPermissionModes(t *testing.T) {
+	modes := []string{"default", "plan", "acceptEdits", "bypassPermissions", "dontAsk", "auto"}
+	for _, mode := range modes {
+		yaml := []byte(fmt.Sprintf(`
+providers:
+  ollama:
+    type: ollama
+    base_url: http://localhost:11434
+models:
+  m:
+    provider: ollama
+    model: llama3
+agents:
+  cc:
+    type: claude-code
+    permission_mode: %s
+roles:
+  polecat:
+    agent: cc
+defaults:
+  model: m
+`, mode))
+		if _, err := ParseConfig(yaml); err != nil {
+			t.Errorf("permission_mode %q should be valid but got error: %v", mode, err)
+		}
+	}
+}
+
+func TestAgentConfig_NegativeMaxBudget(t *testing.T) {
+	bad := []byte(`
+providers:
+  ollama:
+    type: ollama
+    base_url: http://localhost:11434
+models:
+  m:
+    provider: ollama
+    model: llama3
+agents:
+  cc:
+    type: claude-code
+    max_budget_usd: -1.5
+roles:
+  polecat:
+    agent: cc
+defaults:
+  model: m
+`)
+	_, err := ParseConfig(bad)
+	if err == nil {
+		t.Error("expected validation error for negative max_budget_usd")
+	}
+}
+
+func TestAgentConfig_CCFieldsOnNonCCAgent(t *testing.T) {
+	bad := []byte(`
+providers:
+  ollama:
+    type: ollama
+    base_url: http://localhost:11434
+models:
+  m:
+    provider: ollama
+    model: llama3
+agents:
+  a:
+    type: aider
+    system_prompt: "should not be allowed"
+roles:
+  polecat:
+    agent: a
+defaults:
+  model: m
+`)
+	_, err := ParseConfig(bad)
+	if err == nil {
+		t.Error("expected validation error for claude-code fields on non-claude-code agent")
+	}
+}
+
+func TestAgentConfig_AllCCFields(t *testing.T) {
+	yaml := []byte(`
+providers:
+  ollama:
+    type: ollama
+    base_url: http://localhost:11434
+models:
+  m:
+    provider: ollama
+    model: llama3
+agents:
+  cc-reviewer:
+    type: claude-code
+    model: opus
+    system_prompt: "You are a code reviewer."
+    allowed_tools:
+      - Read
+      - Glob
+      - Grep
+    disallowed_tools:
+      - Bash
+    json_schema: '{"type":"object","properties":{"score":{"type":"number"}}}'
+    permission_mode: plan
+    max_budget_usd: 1.5
+    add_dirs:
+      - /data/src
+roles:
+  reviewer:
+    agent: cc-reviewer
+defaults:
+  model: m
+`)
+	cfg, err := ParseConfig(yaml)
+	if err != nil {
+		t.Fatalf("ParseConfig failed: %v", err)
+	}
+	ac := cfg.Agents["cc-reviewer"]
+	if ac.SystemPrompt != "You are a code reviewer." {
+		t.Errorf("unexpected system_prompt: %q", ac.SystemPrompt)
+	}
+	if len(ac.AllowedTools) != 3 || ac.AllowedTools[0] != "Read" {
+		t.Errorf("unexpected allowed_tools: %v", ac.AllowedTools)
+	}
+	if len(ac.DisallowedTools) != 1 || ac.DisallowedTools[0] != "Bash" {
+		t.Errorf("unexpected disallowed_tools: %v", ac.DisallowedTools)
+	}
+	if ac.JSONSchema != `{"type":"object","properties":{"score":{"type":"number"}}}` {
+		t.Errorf("unexpected json_schema: %q", ac.JSONSchema)
+	}
+	if ac.PermissionMode != "plan" {
+		t.Errorf("unexpected permission_mode: %q", ac.PermissionMode)
+	}
+	if ac.MaxBudgetUSD != 1.5 {
+		t.Errorf("unexpected max_budget_usd: %g", ac.MaxBudgetUSD)
+	}
+	if len(ac.AddDirs) != 1 || ac.AddDirs[0] != "/data/src" {
+		t.Errorf("unexpected add_dirs: %v", ac.AddDirs)
+	}
+}
+
 func TestResolveRole_Default(t *testing.T) {
 	cfg, err := ParseConfig(testConfigYAML)
 	if err != nil {
