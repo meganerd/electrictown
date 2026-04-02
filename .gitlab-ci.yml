@@ -3,54 +3,22 @@ stages:
   - build
   - security
 
+include:
+  - project: 'meganerd/ci-templates'
+    file: '/go/test.yml'
+    ref: 'v1.0.1'
+  - project: 'meganerd/ci-templates'
+    file: '/go/lint.yml'
+    ref: 'v1.0.1'
+  - project: 'meganerd/ci-templates'
+    file: '/go/build.yml'
+    ref: 'v1.0.1'
+  - project: 'meganerd/ci-templates'
+    file: '/go/security.yml'
+    ref: 'v1.0.1'
+
 variables:
-  GOPATH: ${CI_PROJECT_DIR}/.go
-  GOFLAGS: "-mod=readonly"
-
-default:
-  image: golang:1.26
-  tags:
-    - docker
-  cache:
-    key: ${CI_COMMIT_REF_SLUG}
-    paths:
-      - .go/pkg/mod/
-
-test:
-  stage: test
-  script:
-    - go test ./... -v -race -coverprofile=coverage.out
-    - go tool cover -func=coverage.out
-
-lint:
-  stage: test
-  image: golangci/golangci-lint:v2.11
-  script:
-    - golangci-lint run --new-from-rev=${CI_MERGE_REQUEST_DIFF_BASE_SHA:-HEAD~1} ./...
-    - golangci-lint run --new=false ./... || true
-
-build:
-  stage: build
-  script:
-    - go build -ldflags "-X main.version=${CI_COMMIT_TAG:-${CI_COMMIT_SHORT_SHA}}" -o et ./cmd/et/
-  artifacts:
-    paths:
-      - et
-    expire_in: 1 week
-  needs:
-    - test
-    - lint
-
-security:
-  stage: security
-  image: golang:1.26
-  script:
-    - go install golang.org/x/vuln/cmd/govulncheck@latest
-    - $GOPATH/bin/govulncheck ./...
-  allow_failure: true
-  rules:
-    - if: $CI_PIPELINE_SOURCE == "schedule"
-    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
-      changes:
-        - go.mod
-        - go.sum
+  GO_IMAGE: "golang:1.26"
+  GOLANGCI_LINT_IMAGE: "golangci/golangci-lint:v2.11"
+  GO_BUILD_PATH: "./cmd/et/"
+  GO_BINARY_NAME: "et"

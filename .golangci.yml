@@ -8,7 +8,27 @@ linters:
     - unused
     - gosec
     - ineffassign
+    - depguard
+    - gomoddirectives
   settings:
+    depguard:
+      rules:
+        main:
+          list-mode: lax
+          allow:
+            - $gostd
+            - golang.org/x/
+            - github.com/atotto/
+            - github.com/aymanbagabas/
+            - github.com/charmbracelet/
+            - github.com/clipperhouse/
+            - github.com/erikgeiser/
+            - github.com/lucasb-eyer/
+            - github.com/mattn/
+            - github.com/muesli/
+            - github.com/rivo/
+            - github.com/xo/
+            - gopkg.in/
     errcheck:
       exclude-functions:
         - (*os.File).Close
