@@ -1,3 +1,6 @@
+include:
+  - template: Security/Dependency-Scanning.gitlab-ci.yml
+
 stages:
   - test
   - build
@@ -46,11 +49,17 @@ security:
   image: golang:1.26
   script:
     - go install golang.org/x/vuln/cmd/govulncheck@latest
-    - govulncheck ./...
-  allow_failure: true
+    - $GOPATH/bin/govulncheck ./...
+    - go install github.com/sonatype-nexus-community/nancy@latest
+    - go list -json -deps ./... | $GOPATH/bin/nancy sleuth || true
+    - go install github.com/CycloneDX/cyclonedx-gomod/cmd/cyclonedx-gomod@latest
+    - $GOPATH/bin/cyclonedx-gomod mod -json -output bom.json || true
+  artifacts:
+    paths:
+      - bom.json
+    expire_in: 1 week
+    when: always
   rules:
-    - if: $CI_PIPELINE_SOURCE == "schedule"
     - if: $CI_PIPELINE_SOURCE == "merge_request_event"
-      changes:
-        - go.mod
-        - go.sum
+    - if: $CI_PIPELINE_SOURCE == "schedule"
+    - if: $CI_COMMIT_TAG
