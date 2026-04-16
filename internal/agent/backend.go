@@ -20,6 +20,7 @@ const (
 	TypeOpenClaw   AgentType = "openclaw"
 	TypeGeminiCLI  AgentType = "gemini-cli"
 	TypeCursor     AgentType = "cursor"
+	TypeZencoder   AgentType = "zencoder"
 	TypeSkill      AgentType = "skill"
 )
 
@@ -28,7 +29,7 @@ func ValidAgentTypes() []AgentType {
 	return []AgentType{
 		TypeClaudeCode, TypeCodex, TypeAider,
 		TypeOpenCode, TypeOpenClaw, TypeGeminiCLI,
-		TypeCursor, TypeSkill,
+		TypeCursor, TypeZencoder, TypeSkill,
 	}
 }
 

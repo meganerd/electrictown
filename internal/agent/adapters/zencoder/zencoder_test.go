@@ -1,4 +1,4 @@
-package opencode
+package zencoder
 
 import (
 	"testing"
@@ -7,49 +7,38 @@ import (
 )
 
 func TestDefaultCommand(t *testing.T) {
-	if cmd := DefaultCommand(); cmd != "opencode" {
-		t.Errorf("expected 'opencode', got %q", cmd)
+	if cmd := DefaultCommand(); cmd != "zen" {
+		t.Errorf("expected 'zen', got %q", cmd)
 	}
 }
 
-func TestBuildArgs_RunMode(t *testing.T) {
-	a := New()
+func TestBuildArgs_Basic(t *testing.T) {
 	task := agent.Task{Prompt: "fix the bug"}
-	args := a.buildArgs(task)
+	args := buildArgs(task)
 	if args[0] != "run" {
 		t.Errorf("first arg should be 'run', got %q", args[0])
 	}
-	assertContains(t, args, "-q")
 	if args[len(args)-1] != "fix the bug" {
 		t.Error("prompt should be last arg")
 	}
 }
 
 func TestBuildArgs_WithModel(t *testing.T) {
-	a := New()
-	task := agent.Task{Prompt: "test", Model: "anthropic/claude-sonnet"}
-	args := a.buildArgs(task)
-	assertContainsSeq(t, args, "--model", "anthropic/claude-sonnet")
-}
-
-func TestBuildArgs_ServeMode(t *testing.T) {
-	a := NewWithServe("http://devbox:4096")
-	task := agent.Task{Prompt: "test"}
-	args := a.buildArgs(task)
-	assertContainsSeq(t, args, "--attach", "http://devbox:4096")
+	task := agent.Task{Prompt: "test", Model: "gpt-4o"}
+	args := buildArgs(task)
+	assertContainsSeq(t, args, "--model", "gpt-4o")
 }
 
 func TestBuildArgs_WithFlags(t *testing.T) {
-	a := New()
-	task := agent.Task{Prompt: "test", Flags: []string{"--no-git"}}
-	args := a.buildArgs(task)
-	assertContains(t, args, "--no-git")
+	task := agent.Task{Prompt: "test", Flags: []string{"--json"}}
+	args := buildArgs(task)
+	assertContains(t, args, "--json")
 }
 
 func TestNormalize_WithDiff(t *testing.T) {
-	output := "Fixed the issue:\n\n--- a/main.go\n+++ b/main.go\n@@ -1,3 +1,4 @@\n package main\n\n+import \"fmt\"\n func main() {}"
+	output := "Fixed:\n\n--- a/main.go\n+++ b/main.go\n@@ -1,3 +1,4 @@\n package main\n\n+import \"fmt\"\n func main() {}"
 	result := &agent.Result{Stdout: output, ExitCode: 0}
-	n := &OpenCodeNormalizer{}
+	n := &ZencoderNormalizer{}
 	if err := n.Normalize(result); err != nil {
 		t.Fatalf("normalize failed: %v", err)
 	}
@@ -60,7 +49,7 @@ func TestNormalize_WithDiff(t *testing.T) {
 
 func TestNormalize_PlainText(t *testing.T) {
 	result := &agent.Result{Stdout: "no changes", ExitCode: 0}
-	n := &OpenCodeNormalizer{}
+	n := &ZencoderNormalizer{}
 	if err := n.Normalize(result); err != nil {
 		t.Fatalf("normalize failed: %v", err)
 	}
@@ -69,22 +58,23 @@ func TestNormalize_PlainText(t *testing.T) {
 	}
 }
 
+func TestNormalize_Empty(t *testing.T) {
+	result := &agent.Result{Stdout: "", ExitCode: 0}
+	n := &ZencoderNormalizer{}
+	if err := n.Normalize(result); err != nil {
+		t.Fatalf("normalize failed: %v", err)
+	}
+}
+
 func TestAdapterType(t *testing.T) {
 	a := New()
-	if a.Type() != agent.TypeOpenCode {
-		t.Errorf("expected type %q, got %q", agent.TypeOpenCode, a.Type())
+	if a.Type() != agent.TypeZencoder {
+		t.Errorf("expected type %q, got %q", agent.TypeZencoder, a.Type())
 	}
 }
 
 func TestAdapterImplementsBackend(t *testing.T) {
 	var _ agent.Backend = (*Adapter)(nil)
-}
-
-func TestBuildArgs_ZenModelID(t *testing.T) {
-	a := New()
-	task := agent.Task{Prompt: "test", Model: "opencode/gpt-5.3-codex"}
-	args := a.buildArgs(task)
-	assertContainsSeq(t, args, "--model", "opencode/gpt-5.3-codex")
 }
 
 func assertContains(t *testing.T, args []string, want string) {

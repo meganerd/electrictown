@@ -108,7 +108,7 @@ const (
 
 // ValidAgentTypes lists recognized agent type strings.
 var ValidAgentTypes = []string{
-	"claude-code", "codex", "aider", "opencode", "openclaw", "gemini-cli", "cursor", "skill",
+	"claude-code", "codex", "aider", "opencode", "openclaw", "gemini-cli", "cursor", "zencoder", "skill",
 }
 
 // LoadConfig reads and parses an electrictown YAML config file.

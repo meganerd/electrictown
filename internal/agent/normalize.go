@@ -84,6 +84,7 @@ var NormalizerRegistry = map[AgentType]Normalizer{
 	TypeOpenCode:   &DefaultNormalizer{},
 	TypeOpenClaw:   &DefaultNormalizer{},
 	TypeGeminiCLI:  &DefaultNormalizer{},
+	TypeZencoder:   &DefaultNormalizer{},
 }
 
 // GetNormalizer returns the normalizer for an agent type, falling back to

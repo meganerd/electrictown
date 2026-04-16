@@ -30,6 +30,7 @@ import (
 	agentgeminicli "github.com/meganerd/electrictown/internal/agent/adapters/geminicli"
 	agentopencode "github.com/meganerd/electrictown/internal/agent/adapters/opencode"
 	agentskill "github.com/meganerd/electrictown/internal/agent/adapters/skill"
+	agentzencoder "github.com/meganerd/electrictown/internal/agent/adapters/zencoder"
 	"github.com/meganerd/electrictown/internal/build"
 	"github.com/meganerd/electrictown/internal/cache"
 	"github.com/meganerd/electrictown/internal/cost"
@@ -271,6 +272,8 @@ func buildAgentBackend(ac *provider.AgentConfig) agent.Backend {
 		return agentopencode.New()
 	case "gemini-cli":
 		return agentgeminicli.New()
+	case "zencoder":
+		return agentzencoder.New()
 	case "skill":
 		return agentskill.New(ac.Command, ac.SkillPath, ac.InputMode)
 	default:
